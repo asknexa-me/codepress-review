@@ -685,6 +685,14 @@ const ReviewCompletionSchema = zod_1.z.object({
     commentsPosted: zod_1.z.number().describe("Number of inline comments posted during this review"),
     /** The review verdict submitted */
     verdict: zod_1.z.enum(["APPROVE", "REQUEST_CHANGES", "COMMENT", "NONE"]).describe("The verdict submitted with gh pr review, or NONE if no review was submitted"),
+    findings: zod_1.z.array(zod_1.z.object({
+        severity: zod_1.z.enum(["required", "optional"]),
+        path: zod_1.z.string(),
+        line: zod_1.z.number().int().positive().nullable(),
+        title: zod_1.z.string(),
+        body: zod_1.z.string(),
+        evidence: zod_1.z.string(),
+    })).default([]),
 });
 /**
  * Formats existing review comments from OTHER reviewers into a readable string.
@@ -835,10 +843,12 @@ blockingOnly = false, existingComments = [], botPreviousComments = [], relatedRe
     const model = await (0, model_factory_1.createModel)(modelConfig);
     // Create the intervention filter
     const interventionFilter = createInterventionFilter(reviewState);
+    const isolatedReview = process.env.ISOLATED_REVIEW === "true";
+    const isolatedInstructions = `You are a read-only code review agent. You may read and search only files under the current repository root. Read docs/development-workflow.md, .codex/rules, the relevant docs/design file, and related architecture documents before deciding. Trace callers and dependencies with the available read-only tools. Never request, reveal, or infer credentials. Do not modify files, execute commands, access the network, post comments, edit a pull request, approve, merge, or deploy. Return structured findings only. A successful run means the review completed; it never means findings were fixed.`;
     const agent = new agents_1.Agent({
         model: (0, agents_extensions_1.aisdk)(model),
         name: "CodePressReviewAgent",
-        instructions: (0, agent_system_prompt_1.getInteractiveSystemPrompt)(blockingOnly, maxTurns),
+        instructions: isolatedReview ? isolatedInstructions : (0, agent_system_prompt_1.getInteractiveSystemPrompt)(blockingOnly, maxTurns),
         tools: (0, tools_1.getAllTools)(),
         // Structured output type - the loop continues until this is produced
         // Using z.literal(true) for `completed` ensures the agent must explicitly
@@ -921,7 +931,7 @@ Only review the files listed above. Fetch individual patches as needed, not the 
 Files will be fetched via: \`gh api repos/${prContext.repo}/pulls/${prContext.prNumber}/files\`
 Note: Lock files, build outputs, and generated files should be skipped.
 </prFiles>\n`;
-    const initialMessage = `
+    const originalInitialMessage = `
 You are reviewing PR #${prContext.prNumber} in repository ${prContext.repo}.
 Commit SHA: ${prContext.commitSha}
 
@@ -1029,6 +1039,7 @@ ${blockingOnly ? "- BLOCKING-ONLY MODE: Only comment on critical issues that MUS
 ${isReReview ? "" : `
 **Remember: You MUST submit a formal review at the end using \`gh pr review\`.`}
 </instruction>`;
+    const initialMessage = isolatedReview ? `Review PR #${prContext.prNumber} at commit ${prContext.commitSha}.\n\n<repositoryFiles>\n${fileList}\n</repositoryFiles>\n\n${prFilesSection}\n\nRead the repository development rules and relevant architecture/design documents. Review every changed file, then trace related callers and contracts. Return a concise summary, verdict, and findings. Set commentsPosted to 0 because publishing is handled by a separate trusted job.` : originalInitialMessage;
     // Create a runner with custom workflow name for tracing
     const runner = new agents_1.Runner({
         workflowName: `${prContext.repo}#${prContext.prNumber}`,
@@ -1055,7 +1066,7 @@ ${isReReview ? "" : `
         // When maxTurns is null (meaning "unlimited"), we pass a very large number.
         const effectiveMaxTurns = maxTurns ?? Number.MAX_SAFE_INTEGER;
         const runOptions = {
-            callModelInputFilter: interventionFilter,
+            ...(isolatedReview ? {} : { callModelInputFilter: interventionFilter }),
             maxTurns: effectiveMaxTurns,
         };
         const result = await runner.run(agent, initialMessage, runOptions);
@@ -1065,11 +1076,13 @@ ${isReReview ? "" : `
             (0, debug_1.debugLog)(`  Summary: ${result.finalOutput.summary}`);
             (0, debug_1.debugLog)(`  Comments posted (self-reported): ${result.finalOutput.commentsPosted}`);
             (0, debug_1.debugLog)(`  Comments posted (tracked): ${reviewState.commentsPostedThisRun.length}`);
+            return result.finalOutput;
         }
         else {
             (0, debug_1.debugLog)("Agent completed without structured output (unexpected).");
             (0, debug_1.debugLog)(`  Comments posted this run: ${reviewState.commentsPostedThisRun.length}`);
             (0, debug_1.debugLog)(`  Review submitted: ${reviewState.hasSubmittedReview}`);
+            throw new Error("Agent completed without structured review output");
         }
     }
     catch (error) {
@@ -2657,7 +2670,6 @@ exports.allTools = [...baseTools, ...webTools];
 
 "use strict";
 
-
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.main = main;
 const config_1 = __nccwpck_require__(26634);
@@ -3527,6 +3539,20 @@ function shouldRunAction(context, config) {
 }
 async function run() {
     try {
+        if (core.getBooleanInput("isolated_mode")) {
+            const { runIsolatedReview } = await Promise.resolve().then(() => __importStar(__nccwpck_require__(44484)));
+            const provider = core.getInput("model_provider", { required: true });
+            const modelName = core.getInput("model_name", { required: true });
+            const deepseekApiKey = core.getInput("deepseek_api_key", { required: true });
+            const repositoryPath = core.getInput("repository_path", { required: true });
+            process.env.MODEL_PROVIDER = provider;
+            process.env.MODEL_NAME = modelName;
+            process.env.DEEPSEEK_API_KEY = deepseekApiKey;
+            process.chdir(repositoryPath);
+            await runIsolatedReview(core.getInput("review_input", { required: true }), core.getInput("report_path", { required: true }));
+            core.info("Isolated review report generated; this action did not publish or modify the pull request.");
+            return;
+        }
         // Get inputs from action.yml
         const githubToken = core.getInput("github_token", { required: true });
         const modelProvider = core.getInput("model_provider", { required: true });
@@ -3937,6 +3963,37 @@ if (process.env.NODE_ENV !== "test") {
     run();
 }
 //# sourceMappingURL=index.js.map
+
+/***/ }),
+
+/***/ 44484:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.runIsolatedReview = runIsolatedReview;
+const fs_1 = __nccwpck_require__(79896);
+const path_1 = __nccwpck_require__(16928);
+const agent_1 = __nccwpck_require__(70368);
+const config_1 = __nccwpck_require__(26634);
+async function runIsolatedReview(inputPath, reportPath) {
+    const input = JSON.parse((0, fs_1.readFileSync)((0, path_1.resolve)(inputPath), "utf8"));
+    if (!input.repo || !input.prNumber || !/^[0-9a-f]{40}$/i.test(input.commitSha)) {
+        throw new Error("Invalid isolated review input");
+    }
+    process.env.ISOLATED_REVIEW = "true";
+    process.env.ENABLE_WEB_SEARCH = "false";
+    const result = await (0, agent_1.reviewFullDiff)(await (0, config_1.getModelConfig)(), input.repositoryFiles, { repo: input.repo, prNumber: input.prNumber, commitSha: input.commitSha }, 18, false, [], [], [], input.prFilesFormatted);
+    (0, fs_1.writeFileSync)((0, path_1.resolve)(reportPath), JSON.stringify({
+        schemaVersion: 1,
+        repository: input.repo,
+        pullRequest: input.prNumber,
+        commitSha: input.commitSha,
+        result,
+    }, null, 2), { encoding: "utf8", mode: 0o600 });
+}
+//# sourceMappingURL=isolated-review.js.map
 
 /***/ }),
 

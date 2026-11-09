@@ -149,6 +149,20 @@ function shouldRunAction(context, config) {
 }
 async function run() {
     try {
+        if (core.getBooleanInput("isolated_mode")) {
+            const { runIsolatedReview } = await Promise.resolve().then(() => __importStar(require("./isolated-review")));
+            const provider = core.getInput("model_provider", { required: true });
+            const modelName = core.getInput("model_name", { required: true });
+            const deepseekApiKey = core.getInput("deepseek_api_key", { required: true });
+            const repositoryPath = core.getInput("repository_path", { required: true });
+            process.env.MODEL_PROVIDER = provider;
+            process.env.MODEL_NAME = modelName;
+            process.env.DEEPSEEK_API_KEY = deepseekApiKey;
+            process.chdir(repositoryPath);
+            await runIsolatedReview(core.getInput("review_input", { required: true }), core.getInput("report_path", { required: true }));
+            core.info("Isolated review report generated; this action did not publish or modify the pull request.");
+            return;
+        }
         // Get inputs from action.yml
         const githubToken = core.getInput("github_token", { required: true });
         const modelProvider = core.getInput("model_provider", { required: true });
