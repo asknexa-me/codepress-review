@@ -21,6 +21,15 @@ const agentTodoList: Array<{ task: string; done: boolean }> = [];
 const SEARCH_CACHE: Map<string, string> = new Map();
 const LRU_MAX = 100;
 
+export function resolveRepoPath(path: string): string | null {
+  const root = resolve(process.cwd());
+  const target = resolve(root, path);
+  if (target !== root && !target.startsWith(`${root}\\`) && !target.startsWith(`${root}/`)) {
+    return null;
+  }
+  return target;
+}
+
 /**
  * Resolve a working ripgrep binary path.
  * - Prefer @vscode/ripgrep's downloaded binary if it exists
@@ -348,7 +357,8 @@ export const fetchFilesTool = tool({
   execute: async ({ paths }) => {
     const outputs: string[] = [];
     for (const path of paths) {
-      const absolutePath = resolve(process.cwd(), path);
+      const absolutePath = resolveRepoPath(path);
+      if (!absolutePath) return `Error: Path escapes repository root: ${path}`;
       if (!existsSync(absolutePath)) {
         outputs.push(`=== ${path} ===\nError: File not found at ${path}`);
         continue;
@@ -389,7 +399,8 @@ export const fetchSnippetTool = tool({
       ),
   }),
   execute: async ({ path, searchText, contextLines = 5 }) => {
-    const absolutePath = resolve(process.cwd(), path);
+    const absolutePath = resolveRepoPath(path);
+    if (!absolutePath) return `Error: Path escapes repository root: ${path}`;
     if (!existsSync(absolutePath)) {
       return `Error: File not found at ${path}`;
     }
@@ -456,7 +467,9 @@ export const depGraphTool = tool({
     depth: z.number().int().min(1).describe("Depth of the graph to traverse"),
   }),
   execute: async ({ path, depth }) => {
-    if (!existsSync(resolve(process.cwd(), path))) {
+    const absolutePath = resolveRepoPath(path);
+    if (!absolutePath) return `Error: Path escapes repository root: ${path}`;
+    if (!existsSync(absolutePath)) {
       return `Error: File not found at ${path}`;
     }
 
@@ -1452,7 +1465,6 @@ Be specific in your queries for better results.`,
 
 // Base tools always included
 const baseTools = [
-  bashTool,
   depGraphTool,
   todoTool,
   fetchFilesTool,
@@ -1468,6 +1480,7 @@ const webTools = [webFetchTool, webSearchTool];
  * Web search tools are enabled by default but can be disabled via ENABLE_WEB_SEARCH=false.
  */
 export function getAllTools() {
+  if (process.env.ISOLATED_REVIEW === "true") return baseTools;
   const enableWebSearch = process.env.ENABLE_WEB_SEARCH?.toLowerCase() !== "false";
   return enableWebSearch ? [...baseTools, ...webTools] : baseTools;
 }

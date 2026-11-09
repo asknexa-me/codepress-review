@@ -38,6 +38,14 @@ const ReviewCompletionSchema = z.object({
   commentsPosted: z.number().describe("Number of inline comments posted during this review"),
   /** The review verdict submitted */
   verdict: z.enum(["APPROVE", "REQUEST_CHANGES", "COMMENT", "NONE"]).describe("The verdict submitted with gh pr review, or NONE if no review was submitted"),
+  findings: z.array(z.object({
+    severity: z.enum(["required", "optional"]),
+    path: z.string(),
+    line: z.number().int().positive().nullable(),
+    title: z.string(),
+    body: z.string(),
+    evidence: z.string(),
+  })).default([]),
 });
 
 export type ReviewCompletion = z.infer<typeof ReviewCompletionSchema>;
@@ -215,7 +223,7 @@ export async function reviewFullDiff(
   botPreviousComments: BotComment[] = [],
   relatedRepos: RelatedRepo[] = [],
   prFilesFormatted: string = "", // Pre-filtered PR files section
-): Promise<void> {
+): Promise<ReviewCompletion> {
   // Reset todo list for fresh review
   resetTodoList();
 
@@ -230,10 +238,12 @@ export async function reviewFullDiff(
   // Create the intervention filter
   const interventionFilter = createInterventionFilter(reviewState);
 
+  const isolatedReview = process.env.ISOLATED_REVIEW === "true";
+  const isolatedInstructions = `You are a read-only code review agent. You may read and search only files under the current repository root. Read docs/development-workflow.md, .codex/rules, the relevant docs/design file, and related architecture documents before deciding. Trace callers and dependencies with the available read-only tools. Never request, reveal, or infer credentials. Do not modify files, execute commands, access the network, post comments, edit a pull request, approve, merge, or deploy. Return structured findings only. A successful run means the review completed; it never means findings were fixed.`;
   const agent = new Agent({
     model: aisdk(model),
     name: "CodePressReviewAgent",
-    instructions: getInteractiveSystemPrompt(blockingOnly, maxTurns),
+    instructions: isolatedReview ? isolatedInstructions : getInteractiveSystemPrompt(blockingOnly, maxTurns),
     tools: getAllTools(),
     // Structured output type - the loop continues until this is produced
     // Using z.literal(true) for `completed` ensures the agent must explicitly
@@ -330,7 +340,7 @@ Files will be fetched via: \`gh api repos/${prContext.repo}/pulls/${prContext.pr
 Note: Lock files, build outputs, and generated files should be skipped.
 </prFiles>\n`;
 
-  const initialMessage = `
+  const originalInitialMessage = `
 You are reviewing PR #${prContext.prNumber} in repository ${prContext.repo}.
 Commit SHA: ${prContext.commitSha}
 
@@ -438,6 +448,7 @@ ${blockingOnly ? "- BLOCKING-ONLY MODE: Only comment on critical issues that MUS
 ${isReReview ? "" : `
 **Remember: You MUST submit a formal review at the end using \`gh pr review\`.`}
 </instruction>`;
+  const initialMessage = isolatedReview ? `Review PR #${prContext.prNumber} at commit ${prContext.commitSha}.\n\n<repositoryFiles>\n${fileList}\n</repositoryFiles>\n\n${prFilesSection}\n\nRead the repository development rules and relevant architecture/design documents. Review every changed file, then trace related callers and contracts. Return a concise summary, verdict, and findings. Set commentsPosted to 0 because publishing is handled by a separate trusted job.` : originalInitialMessage;
 
   // Create a runner with custom workflow name for tracing
   const runner = new Runner({
@@ -469,7 +480,7 @@ ${isReReview ? "" : `
     // When maxTurns is null (meaning "unlimited"), we pass a very large number.
     const effectiveMaxTurns = maxTurns ?? Number.MAX_SAFE_INTEGER;
     const runOptions = {
-      callModelInputFilter: interventionFilter,
+      ...(isolatedReview ? {} : { callModelInputFilter: interventionFilter }),
       maxTurns: effectiveMaxTurns,
     };
 
@@ -481,10 +492,12 @@ ${isReReview ? "" : `
       debugLog(`  Summary: ${result.finalOutput.summary}`);
       debugLog(`  Comments posted (self-reported): ${result.finalOutput.commentsPosted}`);
       debugLog(`  Comments posted (tracked): ${reviewState.commentsPostedThisRun.length}`);
+      return result.finalOutput;
     } else {
       debugLog("Agent completed without structured output (unexpected).");
       debugLog(`  Comments posted this run: ${reviewState.commentsPostedThisRun.length}`);
       debugLog(`  Review submitted: ${reviewState.hasSubmittedReview}`);
+      throw new Error("Agent completed without structured review output");
     }
   } catch (error: unknown) {
     const errorMessage = error instanceof Error ? error.message : String(error);

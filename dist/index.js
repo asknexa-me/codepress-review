@@ -660,7 +660,7 @@ exports.INTERACTIVE_SYSTEM_PROMPT = getInteractiveSystemPrompt(false, null);
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.reviewFullDiff = reviewFullDiff;
 const agents_1 = __nccwpck_require__(86746);
-const agents_extensions_1 = __nccwpck_require__(35746);
+const agents_extensions_1 = __nccwpck_require__(61256);
 const zod_1 = __nccwpck_require__(98884);
 const debug_1 = __nccwpck_require__(88005);
 const model_factory_1 = __nccwpck_require__(79656);
@@ -685,6 +685,14 @@ const ReviewCompletionSchema = zod_1.z.object({
     commentsPosted: zod_1.z.number().describe("Number of inline comments posted during this review"),
     /** The review verdict submitted */
     verdict: zod_1.z.enum(["APPROVE", "REQUEST_CHANGES", "COMMENT", "NONE"]).describe("The verdict submitted with gh pr review, or NONE if no review was submitted"),
+    findings: zod_1.z.array(zod_1.z.object({
+        severity: zod_1.z.enum(["required", "optional"]),
+        path: zod_1.z.string(),
+        line: zod_1.z.number().int().positive().nullable(),
+        title: zod_1.z.string(),
+        body: zod_1.z.string(),
+        evidence: zod_1.z.string(),
+    })).default([]),
 });
 /**
  * Formats existing review comments from OTHER reviewers into a readable string.
@@ -835,10 +843,12 @@ blockingOnly = false, existingComments = [], botPreviousComments = [], relatedRe
     const model = await (0, model_factory_1.createModel)(modelConfig);
     // Create the intervention filter
     const interventionFilter = createInterventionFilter(reviewState);
+    const isolatedReview = process.env.ISOLATED_REVIEW === "true";
+    const isolatedInstructions = `You are a read-only code review agent. You may read and search only files under the current repository root. Read docs/development-workflow.md, .codex/rules, the relevant docs/design file, and related architecture documents before deciding. Trace callers and dependencies with the available read-only tools. Never request, reveal, or infer credentials. Do not modify files, execute commands, access the network, post comments, edit a pull request, approve, merge, or deploy. Return structured findings only. A successful run means the review completed; it never means findings were fixed.`;
     const agent = new agents_1.Agent({
         model: (0, agents_extensions_1.aisdk)(model),
         name: "CodePressReviewAgent",
-        instructions: (0, agent_system_prompt_1.getInteractiveSystemPrompt)(blockingOnly, maxTurns),
+        instructions: isolatedReview ? isolatedInstructions : (0, agent_system_prompt_1.getInteractiveSystemPrompt)(blockingOnly, maxTurns),
         tools: (0, tools_1.getAllTools)(),
         // Structured output type - the loop continues until this is produced
         // Using z.literal(true) for `completed` ensures the agent must explicitly
@@ -921,7 +931,7 @@ Only review the files listed above. Fetch individual patches as needed, not the 
 Files will be fetched via: \`gh api repos/${prContext.repo}/pulls/${prContext.prNumber}/files\`
 Note: Lock files, build outputs, and generated files should be skipped.
 </prFiles>\n`;
-    const initialMessage = `
+    const originalInitialMessage = `
 You are reviewing PR #${prContext.prNumber} in repository ${prContext.repo}.
 Commit SHA: ${prContext.commitSha}
 
@@ -1029,6 +1039,7 @@ ${blockingOnly ? "- BLOCKING-ONLY MODE: Only comment on critical issues that MUS
 ${isReReview ? "" : `
 **Remember: You MUST submit a formal review at the end using \`gh pr review\`.`}
 </instruction>`;
+    const initialMessage = isolatedReview ? `Review PR #${prContext.prNumber} at commit ${prContext.commitSha}.\n\n<repositoryFiles>\n${fileList}\n</repositoryFiles>\n\n${prFilesSection}\n\nRead the repository development rules and relevant architecture/design documents. Review every changed file, then trace related callers and contracts. Return a concise summary, verdict, and findings. Set commentsPosted to 0 because publishing is handled by a separate trusted job.` : originalInitialMessage;
     // Create a runner with custom workflow name for tracing
     const runner = new agents_1.Runner({
         workflowName: `${prContext.repo}#${prContext.prNumber}`,
@@ -1055,7 +1066,7 @@ ${isReReview ? "" : `
         // When maxTurns is null (meaning "unlimited"), we pass a very large number.
         const effectiveMaxTurns = maxTurns ?? Number.MAX_SAFE_INTEGER;
         const runOptions = {
-            callModelInputFilter: interventionFilter,
+            ...(isolatedReview ? {} : { callModelInputFilter: interventionFilter }),
             maxTurns: effectiveMaxTurns,
         };
         const result = await runner.run(agent, initialMessage, runOptions);
@@ -1065,11 +1076,13 @@ ${isReReview ? "" : `
             (0, debug_1.debugLog)(`  Summary: ${result.finalOutput.summary}`);
             (0, debug_1.debugLog)(`  Comments posted (self-reported): ${result.finalOutput.commentsPosted}`);
             (0, debug_1.debugLog)(`  Comments posted (tracked): ${reviewState.commentsPostedThisRun.length}`);
+            return result.finalOutput;
         }
         else {
             (0, debug_1.debugLog)("Agent completed without structured output (unexpected).");
             (0, debug_1.debugLog)(`  Comments posted this run: ${reviewState.commentsPostedThisRun.length}`);
             (0, debug_1.debugLog)(`  Review submitted: ${reviewState.hasSubmittedReview}`);
+            throw new Error("Agent completed without structured review output");
         }
     }
     catch (error) {
@@ -1371,6 +1384,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 };
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.allTools = exports.webSearchTool = exports.webFetchTool = exports.todoTool = exports.bashTool = exports.searchRepoTool = exports.depGraphTool = exports.fetchSnippetTool = exports.fetchFilesTool = void 0;
+exports.resolveRepoPath = resolveRepoPath;
 exports.runSearchRepo = runSearchRepo;
 exports.resetTodoList = resetTodoList;
 exports.getAllTools = getAllTools;
@@ -1393,6 +1407,14 @@ const agentTodoList = [];
 // Lightweight in-process LRU cache for search results
 const SEARCH_CACHE = new Map();
 const LRU_MAX = 100;
+function resolveRepoPath(path) {
+    const root = (0, path_1.resolve)(process.cwd());
+    const target = (0, path_1.resolve)(root, path);
+    if (target !== root && !target.startsWith(`${root}\\`) && !target.startsWith(`${root}/`)) {
+        return null;
+    }
+    return target;
+}
 /**
  * Resolve a working ripgrep binary path.
  * - Prefer @vscode/ripgrep's downloaded binary if it exists
@@ -1692,7 +1714,9 @@ exports.fetchFilesTool = (0, agents_1.tool)({
     execute: async ({ paths }) => {
         const outputs = [];
         for (const path of paths) {
-            const absolutePath = (0, path_1.resolve)(process.cwd(), path);
+            const absolutePath = resolveRepoPath(path);
+            if (!absolutePath)
+                return `Error: Path escapes repository root: ${path}`;
             if (!(0, fs_1.existsSync)(absolutePath)) {
                 outputs.push(`=== ${path} ===\nError: File not found at ${path}`);
                 continue;
@@ -1728,7 +1752,9 @@ exports.fetchSnippetTool = (0, agents_1.tool)({
             .describe("Number of lines before and after the match to include (default: 5)"),
     }),
     execute: async ({ path, searchText, contextLines = 5 }) => {
-        const absolutePath = (0, path_1.resolve)(process.cwd(), path);
+        const absolutePath = resolveRepoPath(path);
+        if (!absolutePath)
+            return `Error: Path escapes repository root: ${path}`;
         if (!(0, fs_1.existsSync)(absolutePath)) {
             return `Error: File not found at ${path}`;
         }
@@ -1787,7 +1813,10 @@ exports.depGraphTool = (0, agents_1.tool)({
         depth: zod_1.z.number().int().min(1).describe("Depth of the graph to traverse"),
     }),
     execute: async ({ path, depth }) => {
-        if (!(0, fs_1.existsSync)((0, path_1.resolve)(process.cwd(), path))) {
+        const absolutePath = resolveRepoPath(path);
+        if (!absolutePath)
+            return `Error: Path escapes repository root: ${path}`;
+        if (!(0, fs_1.existsSync)(absolutePath)) {
             return `Error: File not found at ${path}`;
         }
         const allFiles = getAllSourceFiles();
@@ -2603,7 +2632,6 @@ Be specific in your queries for better results.`,
 });
 // Base tools always included
 const baseTools = [
-    exports.bashTool,
     exports.depGraphTool,
     exports.todoTool,
     exports.fetchFilesTool,
@@ -2617,6 +2645,8 @@ const webTools = [exports.webFetchTool, exports.webSearchTool];
  * Web search tools are enabled by default but can be disabled via ENABLE_WEB_SEARCH=false.
  */
 function getAllTools() {
+    if (process.env.ISOLATED_REVIEW === "true")
+        return baseTools;
     const enableWebSearch = process.env.ENABLE_WEB_SEARCH?.toLowerCase() !== "false";
     return enableWebSearch ? [...baseTools, ...webTools] : baseTools;
 }
@@ -3497,6 +3527,20 @@ function shouldRunAction(context, config) {
 }
 async function run() {
     try {
+        if (core.getBooleanInput("isolated_mode")) {
+            const { runIsolatedReview } = await Promise.resolve().then(() => __importStar(__nccwpck_require__(44484)));
+            const provider = core.getInput("model_provider", { required: true });
+            const modelName = core.getInput("model_name", { required: true });
+            const deepseekApiKey = core.getInput("deepseek_api_key", { required: true });
+            const repositoryPath = core.getInput("repository_path", { required: true });
+            process.env.MODEL_PROVIDER = provider;
+            process.env.MODEL_NAME = modelName;
+            process.env.DEEPSEEK_API_KEY = deepseekApiKey;
+            process.chdir(repositoryPath);
+            await runIsolatedReview(core.getInput("review_input", { required: true }), core.getInput("report_path", { required: true }));
+            core.info("Isolated review report generated; this action did not publish or modify the pull request.");
+            return;
+        }
         // Get inputs from action.yml
         const githubToken = core.getInput("github_token", { required: true });
         const modelProvider = core.getInput("model_provider", { required: true });
@@ -3907,6 +3951,37 @@ if (process.env.NODE_ENV !== "test") {
     run();
 }
 //# sourceMappingURL=index.js.map
+
+/***/ }),
+
+/***/ 44484:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.runIsolatedReview = runIsolatedReview;
+const fs_1 = __nccwpck_require__(79896);
+const path_1 = __nccwpck_require__(16928);
+const agent_1 = __nccwpck_require__(70368);
+const config_1 = __nccwpck_require__(26634);
+async function runIsolatedReview(inputPath, reportPath) {
+    const input = JSON.parse((0, fs_1.readFileSync)((0, path_1.resolve)(inputPath), "utf8"));
+    if (!input.repo || !input.prNumber || !/^[0-9a-f]{40}$/i.test(input.commitSha)) {
+        throw new Error("Invalid isolated review input");
+    }
+    process.env.ISOLATED_REVIEW = "true";
+    process.env.ENABLE_WEB_SEARCH = "false";
+    const result = await (0, agent_1.reviewFullDiff)(await (0, config_1.getModelConfig)(), input.repositoryFiles, { repo: input.repo, prNumber: input.prNumber, commitSha: input.commitSha }, 18, false, [], [], [], input.prFilesFormatted);
+    (0, fs_1.writeFileSync)((0, path_1.resolve)(reportPath), JSON.stringify({
+        schemaVersion: 1,
+        repository: input.repo,
+        pullRequest: input.prNumber,
+        commitSha: input.commitSha,
+        result,
+    }, null, 2), { encoding: "utf8", mode: 0o600 });
+}
+//# sourceMappingURL=isolated-review.js.map
 
 /***/ }),
 
@@ -4436,7 +4511,7 @@ Object.defineProperties(CSSOM.CSSContainerRule.prototype, {
 			var values = "";
 			var valuesArr = [" {"];
       if (this.cssRules.length) {
-        valuesArr.push(this.cssRules.reduce(function(acc, rule){ 
+        valuesArr.push(this.cssRules.reduce(function(acc, rule){
           if (rule.cssText !== "") {
             acc.push(rule.cssText);
           }
@@ -4637,7 +4712,7 @@ Object.defineProperty(CSSOM.CSSFontFaceRule.prototype, "type", {
 
 Object.defineProperty(CSSOM.CSSFontFaceRule.prototype, "style", {
 	get: function() {
-		return this.__style;	
+		return this.__style;
 	},
 	set: function(value) {
 		if (typeof value === "string") {
@@ -4767,7 +4842,7 @@ Object.defineProperty(CSSOM.CSSGroupingRule.prototype, "cssRules", {
 	}
 	if (parsedRules.length !== 1) {
 		if (isNestedSelector && parsedRules.length === 0 && ruleToParse.indexOf('@font-face') === 0) {
-			errorUtils.throwError(this, 'DOMException', 
+			errorUtils.throwError(this, 'DOMException',
 				"Failed to execute 'insertRule' on '" + this.constructor.name + "': " +
 				"Only conditional nested group rules, style rules, @scope rules, @apply rules, and nested declaration rules may be nested.",
 				'HierarchyRequestError');
@@ -4778,23 +4853,23 @@ Object.defineProperty(CSSOM.CSSGroupingRule.prototype, "cssRules", {
 	var cssRule = parsedRules[0];
 
 	if (cssRule.constructor.name === 'CSSNestedDeclarations' && cssRule.style.length === 0) {
-		errorUtils.throwParseError(this, 'insertRule', this.constructor.name, ruleToParse, 'SyntaxError');	
+		errorUtils.throwParseError(this, 'insertRule', this.constructor.name, ruleToParse, 'SyntaxError');
 	}
-	
+
 	// Check for rules that cannot be inserted inside a CSSGroupingRule
 	if (cssRule.constructor.name === 'CSSImportRule' || cssRule.constructor.name === 'CSSNamespaceRule') {
 		var ruleKeyword = cssRule.constructor.name === 'CSSImportRule' ? '@import' : '@namespace';
-		errorUtils.throwError(this, 'DOMException', 
+		errorUtils.throwError(this, 'DOMException',
 			"Failed to execute 'insertRule' on '" + this.constructor.name + "': " +
 			"'" + ruleKeyword + "' rules cannot be inserted inside a group rule.",
 			'HierarchyRequestError');
 	}
-	
+
 	// Check for CSSLayerStatementRule (@layer statement rules)
 	if (cssRule.constructor.name === 'CSSLayerStatementRule') {
 		errorUtils.throwParseError(this, 'insertRule', this.constructor.name, ruleToParse, 'SyntaxError');
 	}
-	
+
 	cssRule.__parentRule = this;
 	this.cssRules.splice(index, 0, cssRule);
 	return index;
@@ -4876,7 +4951,7 @@ Object.defineProperty(CSSOM.CSSHostRule.prototype, "cssText", {
 		var values = "";
 		var valuesArr = [" {"];
 		if (this.cssRules.length) {
-			valuesArr.push(this.cssRules.reduce(function(acc, rule){ 
+			valuesArr.push(this.cssRules.reduce(function(acc, rule){
 			if (rule.cssText !== "") {
 				acc.push(rule.cssText);
 			}
@@ -5001,7 +5076,7 @@ Object.defineProperty(CSSOM.CSSImportRule.prototype, "parse", {
     var layerRegExp = regexPatterns.layerRegExp;
     var layerRuleNameRegExp = regexPatterns.layerRuleNameRegExp;
     var doubleOrMoreSpacesRegExp = regexPatterns.doubleOrMoreSpacesRegExp;
-    
+
     /**
      * Extracts the content inside supports() handling nested parentheses.
      * @param {string} text - The text to parse
@@ -5012,11 +5087,11 @@ Object.defineProperty(CSSOM.CSSImportRule.prototype, "parse", {
       if (supportsIndex !== 0) {
         return null;
       }
-      
+
       var depth = 0;
       var start = supportsIndex + 'supports('.length;
       var i = start;
-      
+
       for (; i < text.length; i++) {
         if (text[i] === '(') {
           depth++;
@@ -5031,7 +5106,7 @@ Object.defineProperty(CSSOM.CSSImportRule.prototype, "parse", {
           depth--;
         }
       }
-      
+
       return null; // Unbalanced parentheses
     }
 
@@ -5108,7 +5183,7 @@ Object.defineProperty(CSSOM.CSSImportRule.prototype, "parse", {
           if (state === 'media') {
             if (buffer) {
               var bufferTrimmed = buffer.trim();
-              
+
               if (bufferTrimmed.indexOf('layer') === 0) {
                 var layerMatch =  bufferTrimmed.match(layerRegExp);
 
@@ -5214,7 +5289,7 @@ Object.defineProperty(CSSOM.CSSKeyframeRule.prototype, "type", {
 
 Object.defineProperty(CSSOM.CSSKeyframeRule.prototype, "style", {
 	get: function() {
-		return this.__style;	
+		return this.__style;
 	},
 	set: function(value) {
 		if (typeof value === "string") {
@@ -5261,15 +5336,15 @@ CSSOM.CSSKeyframesRule = function CSSKeyframesRule() {
 	CSSOM.CSSRule.call(this);
 	this.name = '';
 	this.cssRules = new CSSOM.CSSRuleList();
-	
+
 	// Set up initial indexed access
 	this._setupIndexedAccess();
-	
+
 	// Override cssRules methods after initial setup, store references as non-enumerable properties
 	var self = this;
 	var originalPush = this.cssRules.push;
 	var originalSplice = this.cssRules.splice;
-	
+
 	// Create non-enumerable method overrides
 	Object.defineProperty(this.cssRules, 'push', {
 		value: function() {
@@ -5281,7 +5356,7 @@ CSSOM.CSSKeyframesRule = function CSSKeyframesRule() {
 		enumerable: false,
 		configurable: true
 	});
-	
+
 	Object.defineProperty(this.cssRules, 'splice', {
 		value: function() {
 			var result = originalSplice.apply(this, arguments);
@@ -5310,7 +5385,7 @@ Object.defineProperty(CSSOM.CSSKeyframesRule.prototype, "cssText", {
     var values = "";
 	var valuesArr = [" {"];
 	if (this.cssRules.length) {
-	valuesArr.push(this.cssRules.reduce(function(acc, rule){ 
+	valuesArr.push(this.cssRules.reduce(function(acc, rule){
 		if (rule.cssText !== "") {
 		acc.push(rule.cssText);
 		}
@@ -5326,7 +5401,7 @@ Object.defineProperty(CSSOM.CSSKeyframesRule.prototype, "cssText", {
 
 /**
  * Appends a new keyframe rule to the list of keyframes.
- * 
+ *
  * @param {string} rule - The keyframe rule string to append (e.g., "50% { opacity: 0.5; }")
  * @see https://www.w3.org/TR/css-animations-1/#dom-csskeyframesrule-appendrule
  */
@@ -5334,7 +5409,7 @@ CSSOM.CSSKeyframesRule.prototype.appendRule = function appendRule(rule) {
 	if (arguments.length === 0) {
 		errorUtils.throwMissingArguments(this, 'appendRule', 'CSSKeyframesRule');
 	}
-	
+
 	var parsedRule;
 	try {
 		// Parse the rule string as a keyframe rule
@@ -5347,14 +5422,14 @@ CSSOM.CSSKeyframesRule.prototype.appendRule = function appendRule(rule) {
 	} catch (e) {
 		errorUtils.throwParseError(this, 'appendRule', 'CSSKeyframesRule', rule);
 	}
-	
+
 	parsedRule.__parentRule = this;
 	this.cssRules.push(parsedRule);
 };
 
 /**
  * Deletes a keyframe rule that matches the specified key.
- * 
+ *
  * @param {string} select - The keyframe selector to delete (e.g., "50%", "from", "to")
  * @see https://www.w3.org/TR/css-animations-1/#dom-csskeyframesrule-deleterule
  */
@@ -5362,9 +5437,9 @@ CSSOM.CSSKeyframesRule.prototype.deleteRule = function deleteRule(select) {
 	if (arguments.length === 0) {
 		errorUtils.throwMissingArguments(this, 'deleteRule', 'CSSKeyframesRule');
 	}
-	
+
 	var normalizedSelect = this._normalizeKeyText(select);
-	
+
 	for (var i = 0; i < this.cssRules.length; i++) {
 		var rule = this.cssRules[i];
 		if (this._normalizeKeyText(rule.keyText) === normalizedSelect) {
@@ -5378,7 +5453,7 @@ CSSOM.CSSKeyframesRule.prototype.deleteRule = function deleteRule(select) {
 /**
  * Finds and returns the keyframe rule that matches the specified key.
  * When multiple rules have the same key, returns the last one.
- * 
+ *
  * @param {string} select - The keyframe selector to find (e.g., "50%", "from", "to")
  * @return {CSSKeyframeRule|null} The matching keyframe rule, or null if not found
  * @see https://www.w3.org/TR/css-animations-1/#dom-csskeyframesrule-findrule
@@ -5387,9 +5462,9 @@ CSSOM.CSSKeyframesRule.prototype.findRule = function findRule(select) {
 	if (arguments.length === 0) {
 		errorUtils.throwMissingArguments(this, 'findRule', 'CSSKeyframesRule');
 	}
-	
+
 	var normalizedSelect = this._normalizeKeyText(select);
-	
+
 	// Iterate backwards to find the last matching rule
 	for (var i = this.cssRules.length - 1; i >= 0; i--) {
 		var rule = this.cssRules[i];
@@ -5397,30 +5472,30 @@ CSSOM.CSSKeyframesRule.prototype.findRule = function findRule(select) {
 			return rule;
 		}
 	}
-	
+
 	return null;
 };
 
 /**
  * Normalizes keyframe selector text for comparison.
  * Handles "from" -> "0%" and "to" -> "100%" conversions and trims whitespace.
- * 
+ *
  * @private
  * @param {string} keyText - The keyframe selector text to normalize
  * @return {string} The normalized keyframe selector text
  */
 CSSOM.CSSKeyframesRule.prototype._normalizeKeyText = function _normalizeKeyText(keyText) {
 	if (!keyText) return '';
-	
+
 	var normalized = keyText.toString().trim().toLowerCase();
-	
+
 	// Convert keywords to percentages for comparison
 	if (normalized === 'from') {
 		return '0%';
 	} else if (normalized === 'to') {
 		return '100%';
 	}
-	
+
 	return normalized;
 };
 
@@ -5432,7 +5507,7 @@ if (typeof Symbol !== 'undefined' && Symbol.iterator) {
 	CSSOM.CSSKeyframesRule.prototype[Symbol.iterator] = function() {
 		var index = 0;
 		var cssRules = this.cssRules;
-		
+
 		return {
 			next: function() {
 				if (index < cssRules.length) {
@@ -5459,7 +5534,7 @@ CSSOM.CSSKeyframesRule.prototype._setupIndexedAccess = function() {
 			break;
 		}
 	}
-	
+
 	// Add indexed getters for current cssRules
 	for (var i = 0; i < this.cssRules.length; i++) {
 		(function(index) {
@@ -5472,7 +5547,7 @@ CSSOM.CSSKeyframesRule.prototype._setupIndexedAccess = function() {
 			});
 		}.call(this, i));
 	}
-	
+
 	// Update length property
 	Object.defineProperty(this, 'length', {
 		get: function() {
@@ -5530,7 +5605,7 @@ Object.defineProperties(CSSOM.CSSLayerBlockRule.prototype, {
 			var values = "";
 			var valuesArr = [" {"];
       if (this.cssRules.length) {
-        valuesArr.push(this.cssRules.reduce(function(acc, rule){ 
+        valuesArr.push(this.cssRules.reduce(function(acc, rule){
           if (rule.cssText !== "") {
             acc.push(rule.cssText);
           }
@@ -5653,7 +5728,7 @@ Object.defineProperties(CSSOM.CSSMediaRule.prototype, {
 			var values = "";
 			var valuesArr = [" {"];
       if (this.cssRules.length) {
-        valuesArr.push(this.cssRules.reduce(function(acc, rule){ 
+        valuesArr.push(this.cssRules.reduce(function(acc, rule){
           if (rule.cssText !== "") {
             acc.push(rule.cssText);
           }
@@ -5823,7 +5898,7 @@ Object.defineProperty(CSSOM.CSSNestedDeclarations.prototype, "type", {
 
 Object.defineProperty(CSSOM.CSSNestedDeclarations.prototype, "style", {
 	get: function() {
-		return this.__style;	
+		return this.__style;
 	},
 	set: function(value) {
 		if (typeof value === "string") {
@@ -5852,7 +5927,7 @@ exports.CSSNestedDeclarations = CSSOM.CSSNestedDeclarations;
 var CSSOM = {
   /**
    * Creates and configures a new CSSOM instance with the specified options.
-   * 
+   *
    * @param {Object} opts - Configuration options for the CSSOM instance
    * @param {Object} [opts.globalObject] - Optional global object to be assigned to CSSOM objects prototype
    * @returns {Object} A new CSSOM instance with the applied configuration
@@ -5953,18 +6028,18 @@ Object.defineProperty(CSSOM.CSSPageRule.prototype, "type", {
 
 Object.defineProperty(CSSOM.CSSPageRule.prototype, "selectorText", {
     get: function() {
-        return this.__selectorText;	
+        return this.__selectorText;
     },
     set: function(value) {
         if (typeof value === "string") {
             var trimmedValue = value.trim();
-            
+
             // Empty selector is valid for @page
             if (trimmedValue === '') {
                 this.__selectorText = '';
                 return;
             }
-            
+
 			var atPageRuleSelectorRegExp = regexPatterns.atPageRuleSelectorRegExp;
 			var cssCustomIdentifierRegExp = regexPatterns.cssCustomIdentifierRegExp;
             var match = trimmedValue.match(atPageRuleSelectorRegExp);
@@ -5979,7 +6054,7 @@ Object.defineProperty(CSSOM.CSSPageRule.prototype, "selectorText", {
 						return;
 					}
 				}
-                
+
                 // Validate pseudo-pages if present
                 if (pseudoPages) {
                     var pseudos = pseudoPages.split(':').filter(function(p) { return p; });
@@ -5991,12 +6066,12 @@ Object.defineProperty(CSSOM.CSSPageRule.prototype, "selectorText", {
                             break;
                         }
                     }
-                    
+
                     if (!allValid) {
                         return; // Invalid pseudo-page, do nothing
                     }
                 }
-                
+
 				this.__selectorText = pageName + pseudoPages.toLowerCase();
             }
         }
@@ -6005,7 +6080,7 @@ Object.defineProperty(CSSOM.CSSPageRule.prototype, "selectorText", {
 
 Object.defineProperty(CSSOM.CSSPageRule.prototype, "style", {
 	get: function() {
-		return this.__style;	
+		return this.__style;
 	},
 	set: function(value) {
 		if (typeof value === "string") {
@@ -6022,7 +6097,7 @@ Object.defineProperty(CSSOM.CSSPageRule.prototype, "cssText", {
         if (this.cssRules.length) {
             var valuesArr = [" {"];
             this.style.cssText && valuesArr.push(this.style.cssText);
-            valuesArr.push(this.cssRules.reduce(function(acc, rule){ 
+            valuesArr.push(this.cssRules.reduce(function(acc, rule){
 				if (rule.cssText !== "") {
 					acc.push(rule.cssText);
 				}
@@ -6127,29 +6202,29 @@ Object.defineProperty(CSSOM.CSSPropertyRule.prototype, "parse", {
 		if (!match) {
 			return false;
 		}
-		
+
 		this.__name = match[1];
 		var bodyText = match[2];
-		
+
 		// Parse syntax descriptor (REQUIRED)
 		var syntaxMatch = bodyText.match(/syntax\s*:\s*(['"])([^]*?)\1\s*;/);
 		if (!syntaxMatch) {
 			return false; // syntax is required
 		}
 		this.__syntax = syntaxMatch[2];
-		
+
 		// Syntax cannot be empty
 		if (this.__syntax === "") {
 			return false;
 		}
-		
+
 		// Parse inherits descriptor (REQUIRED)
 		var inheritsMatch = bodyText.match(/inherits\s*:\s*(true|false)\s*;/);
 		if (!inheritsMatch) {
 			return false; // inherits is required
 		}
 		this.__inherits = inheritsMatch[1] === "true";
-		
+
 		// Parse initial-value descriptor (OPTIONAL, but required if syntax is not "*")
 		var initialValueMatch = bodyText.match(/initial-value\s*:\s*([^;]+);/);
 		if (initialValueMatch) {
@@ -6160,7 +6235,7 @@ Object.defineProperty(CSSOM.CSSPropertyRule.prototype, "parse", {
 				return false;
 			}
 		}
-		
+
 		return true; // Successfully parsed
 	}
 });
@@ -6241,7 +6316,7 @@ Object.defineProperties(CSSOM.CSSRule.prototype, {
       return this.__parentStyleSheet
     }
   },
-  
+
   UNKNOWN_RULE: { value: 0, enumerable: true }, // obsolet
   STYLE_RULE: { value: 1, enumerable: true },
   CHARSET_RULE: { value: 2, enumerable: true }, // obsolet
@@ -6340,7 +6415,7 @@ Object.defineProperties(CSSOM.CSSScopeRule.prototype, {
 			var values = "";
 			var valuesArr = [" {"];
       if (this.cssRules.length) {
-        valuesArr.push(this.cssRules.reduce(function(acc, rule){ 
+        valuesArr.push(this.cssRules.reduce(function(acc, rule){
           if (rule.cssText !== "") {
             acc.push(rule.cssText);
           }
@@ -6411,7 +6486,7 @@ Object.defineProperty(CSSOM.CSSStartingStyleRule.prototype, "cssText", {
 		var values = "";
 		var valuesArr = [" {"];
 		if (this.cssRules.length) {
-			valuesArr.push(this.cssRules.reduce(function(acc, rule){ 
+			valuesArr.push(this.cssRules.reduce(function(acc, rule){
 			if (rule.cssText !== "") {
 				acc.push(rule.cssText);
 			}
@@ -6474,7 +6549,7 @@ CSSOM.CSSStyleDeclaration.prototype = {
 	 * @param {string} [priority=null] "important" or null
 	 * @see http://www.w3.org/TR/DOM-Level-2-Style/css.html#CSS-CSSStyleDeclaration-setProperty
 	 */
-	setProperty: function(name, value, priority, parseErrorHandler) 
+	setProperty: function(name, value, priority, parseErrorHandler)
 	{
 		// NOTE: Check viability to add a validation for css values or use a dependency like csstree-validator
 		var basicStylePropertyValueValidationRegExp = regexPatterns.basicStylePropertyValueValidationRegExp
@@ -6487,9 +6562,9 @@ CSSOM.CSSStyleDeclaration.prototype = {
 				this[this.length] = name;
 				this.length++;
 			}
-	
+
 			// If the priority value of the incoming property is "important",
-			// or the value of the existing property is not "important", 
+			// or the value of the existing property is not "important",
 			// then remove the existing property and rewrite it.
 			if (priority || !this._importants[name]) {
 				this.removeProperty(name);
@@ -6646,7 +6721,7 @@ Object.defineProperty(CSSOM.CSSStyleRule.prototype, "type", {
 
 Object.defineProperty(CSSOM.CSSStyleRule.prototype, "selectorText", {
 	get: function() {
-		return this.__selectorText;	
+		return this.__selectorText;
 	},
 	set: function(value) {
 		if (typeof value === "string") {
@@ -6673,7 +6748,7 @@ Object.defineProperty(CSSOM.CSSStyleRule.prototype, "selectorText", {
 
 Object.defineProperty(CSSOM.CSSStyleRule.prototype, "style", {
 	get: function() {
-		return this.__style;	
+		return this.__style;
 	},
 	set: function(value) {
 		if (typeof value === "string") {
@@ -6693,7 +6768,7 @@ Object.defineProperty(CSSOM.CSSStyleRule.prototype, "cssText", {
 			if (this.cssRules.length) {
 				var valuesArr = [" {"];
 				this.style.cssText && valuesArr.push(this.style.cssText);
-				valuesArr.push(this.cssRules.reduce(function(acc, rule){ 
+				valuesArr.push(this.cssRules.reduce(function(acc, rule){
 					if (rule.cssText !== "") {
 						acc.push(rule.cssText);
 					}
@@ -6744,7 +6819,7 @@ CSSOM.CSSStyleSheet = function CSSStyleSheet(opts) {
 	CSSOM.StyleSheet.call(this);
 	this.__constructed = true;
 	this.__cssRules = new CSSOM.CSSRuleList();
-	this.__ownerRule = null; 
+	this.__ownerRule = null;
 
 	if (opts && typeof opts === "object") {
 		if (opts.baseURL && typeof opts.baseURL === "string") {
@@ -6813,7 +6888,7 @@ CSSOM.CSSStyleSheet.prototype.insertRule = function(rule, index) {
 	if (index > this.cssRules.length) {
 		errorUtils.throwIndexError(this, 'insertRule', this.constructor.name, index, this.cssRules.length);
 	}
-	
+
 	var ruleToParse = String(rule);
 	var parseErrors = [];
 	var parsedSheet = CSSOM.parse(ruleToParse, undefined, function(err) {
@@ -6823,7 +6898,7 @@ CSSOM.CSSStyleSheet.prototype.insertRule = function(rule, index) {
 		errorUtils.throwParseError(this, 'insertRule', this.constructor.name, ruleToParse, 'SyntaxError');
 	}
 	var cssRule = parsedSheet.cssRules[0];
-	
+
 	// Helper function to find the last index of a specific rule constructor
 	function findLastIndexOfConstructor(rules, constructorName) {
 		for (var i = rules.length - 1; i >= 0; i--) {
@@ -6833,7 +6908,7 @@ CSSOM.CSSStyleSheet.prototype.insertRule = function(rule, index) {
 		}
 		return -1;
 	}
-	
+
 	// Helper function to find the first index of a rule that's NOT of specified constructors
 	function findFirstNonConstructorIndex(rules, constructorNames) {
 		for (var i = 0; i < rules.length; i++) {
@@ -6843,7 +6918,7 @@ CSSOM.CSSStyleSheet.prototype.insertRule = function(rule, index) {
 		}
 		return rules.length;
 	}
-	
+
 	// Validate rule ordering based on CSS specification
 	if (cssRule.constructor.name === 'CSSImportRule') {
 		if (this.__constructed === true) {
@@ -6859,10 +6934,10 @@ CSSOM.CSSStyleSheet.prototype.insertRule = function(rule, index) {
 				"Failed to execute 'insertRule' on '" + this.constructor.name + "': Failed to insert the rule.",
 				'HierarchyRequestError');
 		}
-		
+
 		// Also cannot insert after @namespace or other rules
 		var firstNonImportIndex = findFirstNonConstructorIndex(this.cssRules, ['CSSImportRule']);
-		if (index > firstNonImportIndex && firstNonImportIndex < this.cssRules.length && 
+		if (index > firstNonImportIndex && firstNonImportIndex < this.cssRules.length &&
 		    this.cssRules[firstNonImportIndex].constructor.name !== 'CSSLayerStatementRule') {
 			errorUtils.throwError(this, 'DOMException',
 				"Failed to execute 'insertRule' on '" + this.constructor.name + "': Failed to insert the rule.",
@@ -6879,25 +6954,25 @@ CSSOM.CSSStyleSheet.prototype.insertRule = function(rule, index) {
 			}
 		}
 		var firstNonImportNamespaceIndex = findFirstNonConstructorIndex(this.cssRules, [
-			'CSSLayerStatementRule', 
-			'CSSImportRule', 
+			'CSSLayerStatementRule',
+			'CSSImportRule',
 			'CSSNamespaceRule'
 		]);
-		
+
 		// Cannot insert before @import rules
 		if (firstImportIndex !== -1 && index <= firstImportIndex) {
 			errorUtils.throwError(this, 'DOMException',
 				"Failed to execute 'insertRule' on '" + this.constructor.name + "': Failed to insert the rule.",
 				'HierarchyRequestError');
 		}
-		
+
 		// Cannot insert if there are already non-special rules
 		if (firstNonImportNamespaceIndex < this.cssRules.length) {
 			errorUtils.throwError(this, 'DOMException',
 				"Failed to execute 'insertRule' on '" + this.constructor.name + "': Failed to insert the rule.",
 				'InvalidStateError');
 		}
-		
+
 		// Cannot insert after other types of rules
 		if (index > firstNonImportNamespaceIndex) {
 			errorUtils.throwError(this, 'DOMException',
@@ -6905,7 +6980,7 @@ CSSOM.CSSStyleSheet.prototype.insertRule = function(rule, index) {
 				'HierarchyRequestError');
 		}
 
-		
+
 	} else if (cssRule.constructor.name === 'CSSLayerStatementRule') {
 		// @layer statement rules can be inserted anywhere before @import and @namespace
 		// No additional restrictions beyond what's already handled
@@ -6916,7 +6991,7 @@ CSSOM.CSSStyleSheet.prototype.insertRule = function(rule, index) {
 			'CSSImportRule',
 			'CSSNamespaceRule'
 		]);
-		
+
 		if (index < firstNonSpecialRuleIndex) {
 			errorUtils.throwError(this, 'DOMException',
 				"Failed to execute 'insertRule' on '" + this.constructor.name + "': Failed to insert the rule.",
@@ -6927,7 +7002,7 @@ CSSOM.CSSStyleSheet.prototype.insertRule = function(rule, index) {
 			errorUtils.throwParseError(this, 'insertRule', this.constructor.name, ruleToParse, 'SyntaxError');
 		}
 	}
-	
+
 	cssRule.__parentStyleSheet = this;
 	this.cssRules.splice(index, 0, cssRule);
 	return index;
@@ -6965,7 +7040,7 @@ CSSOM.CSSStyleSheet.prototype.deleteRule = function(index) {
 	if (index >= this.cssRules.length) {
 		errorUtils.throwIndexError(this, 'deleteRule', this.constructor.name, index, this.cssRules.length);
 	}
-	if (this.cssRules[index]) {		
+	if (this.cssRules[index]) {
 		if (this.cssRules[index].constructor.name == "CSSNamespaceRule") {
 			var shouldContinue = this.cssRules.every(function (rule) {
 				return ['CSSImportRule','CSSLayerStatementRule','CSSNamespaceRule'].indexOf(rule.constructor.name) !== -1
@@ -6993,7 +7068,7 @@ CSSOM.CSSStyleSheet.prototype.removeRule = function(index) {
 
 /**
  * Replaces the rules of a {@link CSSStyleSheet}
- * 
+ *
  * @returns a promise
  * @see https://www.w3.org/TR/cssom-1/#dom-cssstylesheet-replace
  */
@@ -7047,7 +7122,7 @@ CSSOM.CSSStyleSheet.prototype.replace = function(text) {
 
 /**
  * Synchronously replaces the rules of a {@link CSSStyleSheet}
- * 
+ *
  * @see https://www.w3.org/TR/cssom-1/#dom-cssstylesheet-replacesync
  */
 CSSOM.CSSStyleSheet.prototype.replaceSync = function(text) {
@@ -7119,7 +7194,7 @@ CSSOM.CSSSupportsRule = function CSSSupportsRule() {
 
 CSSOM.CSSSupportsRule.prototype = Object.create(CSSOM.CSSConditionRule.prototype);
 CSSOM.CSSSupportsRule.prototype.constructor = CSSOM.CSSSupportsRule;
-  
+
 Object.setPrototypeOf(CSSOM.CSSSupportsRule, CSSOM.CSSConditionRule);
 
 Object.defineProperty(CSSOM.CSSSupportsRule.prototype, "type", {
@@ -7132,7 +7207,7 @@ Object.defineProperty(CSSOM.CSSSupportsRule.prototype, "cssText", {
     var values = "";
     var valuesArr = [" {"];
     if (this.cssRules.length) {
-      valuesArr.push(this.cssRules.reduce(function(acc, rule){ 
+      valuesArr.push(this.cssRules.reduce(function(acc, rule){
         if (rule.cssText !== "") {
           acc.push(rule.cssText);
         }
@@ -7381,7 +7456,7 @@ CSSOM.CSSValueExpression.prototype._parseJSComment = function(token, idx) {
  * @return {Object|false}
  *					- idx:
  *					- text:
- *					or 
+ *					or
  *					false
  *
  */
@@ -7408,14 +7483,14 @@ CSSOM.CSSValueExpression.prototype._parseJSString = function(token, idx, sep) {
  * @return {Object|false}
  *				- idx:
  *				- regExp:
- *				or 
+ *				or
  *				false
  */
 
 /*
 
 all legal RegExp
- 
+
 /a/
 (/a/)
 [/a/]
@@ -7909,7 +7984,7 @@ try {
  * Gets the appropriate error constructor from the global object context.
  * Tries to find the error constructor from parentStyleSheet.__globalObject,
  * then from __globalObject, then falls back to the native constructor.
- * 
+ *
  * @param {Object} context - The CSSOM object (rule, stylesheet, etc.)
  * @param {string} errorType - The error type ('TypeError', 'RangeError', 'DOMException', etc.)
  * @return {Function} The error constructor
@@ -7919,26 +7994,26 @@ function getErrorConstructor(context, errorType) {
 	if (context.parentStyleSheet && context.parentStyleSheet.__globalObject && context.parentStyleSheet.__globalObject[errorType]) {
 		return context.parentStyleSheet.__globalObject[errorType];
 	}
-	
+
 	// Try __parentStyleSheet (alternative naming)
 	if (context.__parentStyleSheet && context.__parentStyleSheet.__globalObject && context.__parentStyleSheet.__globalObject[errorType]) {
 		return context.__parentStyleSheet.__globalObject[errorType];
 	}
-	
+
 	// Try __globalObject on the context itself
 	if (context.__globalObject && context.__globalObject[errorType]) {
 		return context.__globalObject[errorType];
 	}
-	
+
 	// Fall back to native constructor
-	return (typeof global !== 'undefined' && global[errorType]) || 
-	       (typeof window !== 'undefined' && window[errorType]) || 
+	return (typeof global !== 'undefined' && global[errorType]) ||
+	       (typeof window !== 'undefined' && window[errorType]) ||
 	       eval(errorType);
 }
 
 /**
  * Creates an appropriate error with context-aware constructor.
- * 
+ *
  * @param {Object} context - The CSSOM object (rule, stylesheet, etc.)
  * @param {string} errorType - The error type ('TypeError', 'RangeError', 'DOMException', etc.)
  * @param {string} message - The error message
@@ -7951,7 +8026,7 @@ function createError(context, errorType, message, name) {
 
 /**
  * Creates and throws an appropriate error with context-aware constructor.
- * 
+ *
  * @param {Object} context - The CSSOM object (rule, stylesheet, etc.)
  * @param {string} errorType - The error type ('TypeError', 'RangeError', 'DOMException', etc.)
  * @param {string} message - The error message
@@ -7963,7 +8038,7 @@ function throwError(context, errorType, message, name) {
 
 /**
  * Throws a TypeError for missing required arguments.
- * 
+ *
  * @param {Object} context - The CSSOM object
  * @param {string} methodName - The method name (e.g., 'appendRule')
  * @param {string} objectName - The object name (e.g., 'CSSKeyframesRule')
@@ -7973,15 +8048,15 @@ function throwError(context, errorType, message, name) {
 function throwMissingArguments(context, methodName, objectName, required, provided) {
 	required = required || 1;
 	provided = provided || 0;
-	var message = "Failed to execute '" + methodName + "' on '" + objectName + "': " + 
-	              required + " argument" + (required > 1 ? "s" : "") + " required, but only " + 
+	var message = "Failed to execute '" + methodName + "' on '" + objectName + "': " +
+	              required + " argument" + (required > 1 ? "s" : "") + " required, but only " +
 	              provided + " present.";
 	throwError(context, 'TypeError', message);
 }
 
 /**
  * Throws a DOMException for parse errors.
- * 
+ *
  * @param {Object} context - The CSSOM object
  * @param {string} methodName - The method name
  * @param {string} objectName - The object name
@@ -7996,7 +8071,7 @@ function throwParseError(context, methodName, objectName, rule, name) {
 
 /**
  * Throws a DOMException for index errors.
- * 
+ *
  * @param {Object} context - The CSSOM object
  * @param {string} methodName - The method name
  * @param {string} objectName - The object name
@@ -8267,8 +8342,8 @@ CSSOM.parse = function parse(token, opts, errorHandler) {
 	var backslashRegExp = regexPatterns.backslashRegExp;
 
 	/**
-	 * Searches for the first occurrence of a CSS at-rule statement terminator (`;` or `}`) 
-	 * that is not inside a brace block within the given string. Mimics the behavior of a 
+	 * Searches for the first occurrence of a CSS at-rule statement terminator (`;` or `}`)
+	 * that is not inside a brace block within the given string. Mimics the behavior of a
 	 * regular expression match for such terminators, including any trailing whitespace.
 	 * @param {string} str - The string to search for at-rule statement terminators.
 	 * @returns {object | null} {0: string, index: number} or null if no match is found.
@@ -8419,7 +8494,7 @@ CSSOM.parse = function parse(token, opts, errorHandler) {
 
 	/**
 	 * Validates balanced parentheses, brackets, and quotes in a selector.
-	 * 
+	 *
 	 * @param {string} selector - The CSS selector to validate
 	 * @param {boolean} trackAttributes - Whether to track attribute selector context
 	 * @param {boolean} useStack - Whether to use a stack for parentheses (needed for nested validation)
@@ -8622,7 +8697,7 @@ CSSOM.parse = function parse(token, opts, errorHandler) {
 			// Only scan from the last known validation boundary
 			var searchStart = Math.max(0, lastValidationBoundary);
 			var beforeSlice = token.slice(searchStart, i);
-			
+
 			// Use pre-compiled regex instead of creating new one each time
 			var matches = beforeSlice.match(regexBefore);
 			var lastI = matches ? searchStart + beforeSlice.lastIndexOf(matches[matches.length - 1]) : searchStart;
@@ -8801,17 +8876,17 @@ CSSOM.parse = function parse(token, opts, errorHandler) {
 	/**
 	 * Helper function to validate CSS selector syntax without regex backtracking.
 	 * Iteratively parses the selector string to identify valid components.
-	 * 
+	 *
 	 * Supports:
 	 * - Escaped characters (e.g., .class\!, #id\@name)
 	 * - Namespace selectors (ns|element, *|element, |element)
 	 * - All standard CSS selectors (class, ID, type, attribute, pseudo, etc.)
 	 * - Combinators (>, +, ~, whitespace)
 	 * - Nesting selector (&)
-	 * 
+	 *
 	 * This approach eliminates exponential backtracking by using explicit character-by-character
 	 * parsing instead of nested quantifiers in regex.
-	 * 
+	 *
 	 * @param {string} selector - The selector to validate
 	 * @returns {boolean} - True if valid selector syntax
 	 */
@@ -9032,7 +9107,7 @@ CSSOM.parse = function parse(token, opts, errorHandler) {
 	/**
 	 * Validates a basic CSS selector, allowing for deeply nested balanced parentheses in pseudo-classes.
 	 * This function replaces the previous basicSelectorRegExp.
-	 * 
+	 *
 	 * This function matches:
 	 * - Type selectors (e.g., `div`, `span`)
 	 * - Universal selector (`*`)
@@ -9168,13 +9243,13 @@ CSSOM.parse = function parse(token, opts, errorHandler) {
 	/**
 	 * Extract pseudo-classes with arguments from a selector using iterative parsing.
 	 * Replaces the previous globalPseudoClassRegExp to avoid exponential backtracking.
-	 * 
+	 *
 	 * Handles:
 	 * - Regular content without parentheses or quotes
 	 * - Single-quoted strings
-	 * - Double-quoted strings  
+	 * - Double-quoted strings
 	 * - Nested parentheses (arbitrary depth)
-	 * 
+	 *
 	 * @param {string} selector - The CSS selector to parse
 	 * @returns {Array} Array of matches, each with: [fullMatch, pseudoName, pseudoArgs, startIndex]
 	 */
@@ -9406,7 +9481,7 @@ CSSOM.parse = function parse(token, opts, errorHandler) {
 
 	/**
 	 * Validates namespace selectors by checking if the namespace prefix is defined.
-	 * 
+	 *
 	 * @param {string} selector - The CSS selector to validate
 	 * @returns {boolean} Returns true if the namespace is valid, false otherwise
 	 */
@@ -9475,7 +9550,7 @@ CSSOM.parse = function parse(token, opts, errorHandler) {
 	/**
 	 * Normalizes escape sequences in a selector to match browser behavior.
 	 * Decodes escape sequences and re-encodes them in canonical form.
-	 * 
+	 *
 	 * @param {string} selector - The selector to normalize
 	 * @returns {string} Normalized selector
 	 */
@@ -9483,17 +9558,17 @@ CSSOM.parse = function parse(token, opts, errorHandler) {
 		var result = '';
 		var i = 0;
 		var nextChar = '';
-		
+
 		// Track context for identifier boundaries
 		var inIdentifier = false;
 		var inAttribute = false;
 		var attributeDepth = 0;
 		var needsEscapeForIdent = false;
 		var lastWasHexEscape = false;
-		
+
 		while (i < selector.length) {
 			var char = selector[i];
-			
+
 			// Track attribute selector context
 			if (char === '[' && !inAttribute) {
 				inAttribute = true;
@@ -9505,7 +9580,7 @@ CSSOM.parse = function parse(token, opts, errorHandler) {
 				lastWasHexEscape = false;
 				continue;
 			}
-			
+
 			if (inAttribute) {
 				if (char === '[') attributeDepth++;
 				if (char === ']') {
@@ -9524,7 +9599,7 @@ CSSOM.parse = function parse(token, opts, errorHandler) {
 				lastWasHexEscape = false;
 				continue;
 			}
-			
+
 			// Handle escape sequences
 			if (char === '\\') {
 				var escapeLen = getEscapeSequenceLength(selector, i);
@@ -9534,11 +9609,11 @@ CSSOM.parse = function parse(token, opts, errorHandler) {
 					var wasHexEscape = startsWithHexEscapeRegExp.test(escapeSeq);
 					var hadTerminatingSpace = wasHexEscape && escapeSeq[escapeLen - 1] === ' ';
 					nextChar = selector[i + escapeLen] || '';
-					
+
 					// Check if this character needs escaping
 					var needsEscape = false;
 					var useHexEscape = false;
-					
+
 					if (needsEscapeForIdent) {
 						// At start of identifier (after . # or -)
 						// Digits must be escaped, letters/underscore/_/- don't need escaping
@@ -9559,14 +9634,14 @@ CSSOM.parse = function parse(token, opts, errorHandler) {
 							needsEscape = true;
 						}
 					}
-					
+
 					if (needsEscape) {
 						if (useHexEscape) {
 							// Use normalized hex escape
 							var codePoint = decoded.charCodeAt(0);
 							var hex = codePoint.toString(16);
 							result += '\\' + hex;
-							// Add space if next char could continue the hex sequence, 
+							// Add space if next char could continue the hex sequence,
 							// or if at end of selector (to disambiguate the escape)
 							if (isHexDigit(nextChar) || !nextChar || afterHexEscapeSeparatorRegExp.test(nextChar)) {
 								result += ' ';
@@ -9592,7 +9667,7 @@ CSSOM.parse = function parse(token, opts, errorHandler) {
 						}
 						lastWasHexEscape = false;
 					}
-					
+
 					i += escapeLen;
 					// After processing escape, check if we're still needing ident validation
 					// Only stay in needsEscapeForIdent state if decoded was '-'
@@ -9601,7 +9676,7 @@ CSSOM.parse = function parse(token, opts, errorHandler) {
 					continue;
 				}
 			}
-			
+
 			// Handle regular characters
 			if (char === '.' || char === '#') {
 				result += char;
@@ -9667,13 +9742,13 @@ CSSOM.parse = function parse(token, opts, errorHandler) {
 				i++;
 			}
 		}
-		
+
 		return result;
 	}
 
 	/**
 	 * Helper function to decode all escape sequences in a string.
-	 * 
+	 *
 	 * @param {string} str - The string to decode
 	 * @returns {string} The decoded string
 	 */
@@ -9698,7 +9773,7 @@ CSSOM.parse = function parse(token, opts, errorHandler) {
 
 	/**
 	 * Decodes a CSS escape sequence to its character value.
-	 * 
+	 *
 	 * @param {string} escapeSeq - The escape sequence (including backslash)
 	 * @returns {string} The decoded character
 	 */
@@ -9706,9 +9781,9 @@ CSSOM.parse = function parse(token, opts, errorHandler) {
 		if (escapeSeq.length < 2 || escapeSeq[0] !== '\\') {
 			return escapeSeq;
 		}
-		
+
 		var content = escapeSeq.substring(1);
-		
+
 		// Check if it's a hex escape
 		var hexMatch = content.match(hexEscapeSequenceRegExp);
 		if (hexMatch) {
@@ -9723,7 +9798,7 @@ CSSOM.parse = function parse(token, opts, errorHandler) {
 			}
 			return String.fromCharCode(codePoint);
 		}
-		
+
 		// Simple escape - return the character after backslash
 		return content[0] || '';
 	}
@@ -9734,23 +9809,23 @@ CSSOM.parse = function parse(token, opts, errorHandler) {
 	 *   [attr=value] -> [attr="value"]
 	 *   [attr="value"] -> [attr="value"] (unchanged)
 	 *   [attr='value'] -> [attr="value"] (converted to double quotes)
-	 * 
+	 *
 	 * @param {string} selector - The selector to normalize
 	 * @returns {string|null} Normalized selector, or null if invalid
 	 */
 	function normalizeAttributeSelectors(selector) {
 		var result = '';
 		var i = 0;
-		
+
 		while (i < selector.length) {
 			// Look for attribute selector start
 			if (selector[i] === '[') {
 				result += '[';
 				i++;
-				
+
 				var attrContent = '';
 				var depth = 1;
-				
+
 				// Find the closing bracket, handling nested brackets and escapes
 				while (i < selector.length && depth > 0) {
 					if (selector[i] === '\\' && i + 1 < selector.length) {
@@ -9766,7 +9841,7 @@ CSSOM.parse = function parse(token, opts, errorHandler) {
 					attrContent += selector[i];
 					i++;
 				}
-				
+
 				// Normalize the attribute content
 				var normalized = normalizeAttributeContent(attrContent);
 				if (normalized === null) {
@@ -9783,7 +9858,7 @@ CSSOM.parse = function parse(token, opts, errorHandler) {
 				i++;
 			}
 		}
-		
+
 		return result;
 	}
 
@@ -9837,33 +9912,33 @@ CSSOM.parse = function parse(token, opts, errorHandler) {
 	function normalizeAttributeContent(content) {
 		// Match: attribute-name [operator] [value] [flag]
 		var match = content.match(attributeSelectorContentRegExp);
-		
+
 		if (!match) {
 			// No operator (e.g., [disabled]) or malformed - return as is
 			return content;
 		}
-		
+
 		var attrName = match[1];
 		var operator = match[2];
 		var valueAndFlag = match[3].trim(); // Trim here instead of in regex
-		
+
 		// Check if there's a case-sensitivity flag (i or s) at the end
 		var flagMatch = valueAndFlag.match(attributeCaseFlagRegExp);
 		var value = flagMatch ? flagMatch[1] : valueAndFlag;
 		var flag = flagMatch ? flagMatch[2] : '';
-		
+
 		// Check for unclosed quotes - this makes the selector invalid
 		var trimmedValue = value.trim();
 		var firstChar = trimmedValue[0];
-		
+
 		if (firstChar === '"') {
 			return processQuotedAttributeValue(trimmedValue, '"', attrName, operator, flag);
 		}
-		
+
 		if (firstChar === "'") {
 			return processQuotedAttributeValue(trimmedValue, "'", attrName, operator, flag);
 		}
-		
+
 		// Check for unescaped special characters in unquoted values
 		// Escaped special characters are valid (e.g., \` is valid, but ` is not)
 		var hasUnescapedSpecialChar = false;
@@ -9883,26 +9958,26 @@ CSSOM.parse = function parse(token, opts, errorHandler) {
 				break;
 			}
 		}
-		
+
 		if (hasUnescapedSpecialChar) {
 			return null; // Unescaped special characters not allowed in unquoted attribute values
 		}
-		
+
 		// Decode escape sequences in the value before quoting
 		// Inside quotes, special characters don't need escaping
 		var decodedValue = decodeEscapeSequencesInString(trimmedValue);
-		
+
 		// If the decoded value contains double quotes, escape them for the output
 		// (since we're using double quotes as delimiters)
 		var escapedValue = decodedValue.replace(backslashRegExp, '\\\\').replace(doubleQuoteRegExp, '\\"');
-		
+
 		// Unquoted value - add double quotes with decoded and re-escaped content
 		return attrName + operator + '"' + escapedValue + '"' + (flag ? ' ' + flag : '');
 	}
 
 	/**
-	 * Processes a CSS selector text 
-	 * 
+	 * Processes a CSS selector text
+	 *
 	 * @param {string} selectorText - The CSS selector text to process
 	 * @returns {string} The processed selector text with normalized whitespace and invalid selectors removed
 	 */
@@ -9929,7 +10004,7 @@ CSSOM.parse = function parse(token, opts, errorHandler) {
 
 	/**
 	 * Recursively processes pseudo-classes to filter invalid selectors
-	 * 
+	 *
 	 * @param {string} selectorText - The CSS selector text to process
 	 * @param {number} depth - Current recursion depth (to prevent infinite loops)
 	 * @returns {string} The processed selector text with invalid selectors removed
@@ -10011,7 +10086,7 @@ CSSOM.parse = function parse(token, opts, errorHandler) {
 	function hasNewlineInQuotedString(selectorText) {
 		for (var i = 0; i < selectorText.length; i++) {
 			var char = selectorText[i];
-			
+
 			// Start of single-quoted string
 			if (char === "'") {
 				i++;
@@ -10182,9 +10257,9 @@ CSSOM.parse = function parse(token, opts, errorHandler) {
 		if (str[pos] !== '\\' || pos + 1 >= str.length) {
 			return 0;
 		}
-		
+
 		var nextChar = str[pos + 1];
-		
+
 		// Check if it's a hex escape
 		if (isHexDigit(nextChar)) {
 			var hexLength = 1;
@@ -10198,7 +10273,7 @@ CSSOM.parse = function parse(token, opts, errorHandler) {
 			}
 			return 1 + hexLength; // backslash + hex digits
 		}
-		
+
 		// Simple escape: backslash + any character
 		return 2;
 	}
@@ -10587,7 +10662,7 @@ CSSOM.parse = function parse(token, opts, errorHandler) {
 					}
 
 					currentScope = parentRule = styleRule;
-					
+
 					var processedSelectorText = processSelectorText(buffer.trim());
 					// In a nested selector, ensure each selector contains '&' at the beginning, except for selectors that already have '&' somewhere
 					if (originalParentRule && originalParentRule.constructor.name === "CSSStyleRule") {
@@ -10619,12 +10694,12 @@ CSSOM.parse = function parse(token, opts, errorHandler) {
 					currentScope = parentRule = mediaRule;
 					pushToAncestorRules(mediaRule);
 					mediaRule.__parentStyleSheet = styleSheet;
-					
+
 					// Don't reset styleRule to null if it's a nested CSSStyleRule that will contain this @-rule
 					if (!styleRule || styleRule.constructor.name !== "CSSStyleRule" || !styleRule.__parentRule) {
 						styleRule = null; // Reset styleRule when entering @-rule
 					}
-					
+
 					buffer = "";
 					state = "before-selector";
 				} else if (state === "containerBlock") {
@@ -10843,13 +10918,13 @@ CSSOM.parse = function parse(token, opts, errorHandler) {
 					}
 
 					styleRule = new CSSOM.CSSStyleRule();
-					
+
 					// Check if tokenizer detected an unmatched quote BEFORE setting up the rule
 					if (hasUnmatchedQuoteInSelector) {
 						handleUnmatchedQuoteInSelector("before-name");
 						break;
 					}
-					
+
 					var processedSelectorText = processSelectorText(buffer.trim());
 					// In a nested selector, ensure each selector contains '&' at the beginning, except for selectors that already have '&' somewhere
 					if (parentRule.constructor.name === "CSSScopeRule" || (parentRule.constructor.name !== "CSSStyleRule" && parentRule.parentRule === null)) {
@@ -10868,10 +10943,10 @@ CSSOM.parse = function parse(token, opts, errorHandler) {
 					if (parentRule.constructor.name === "CSSStyleRule" || parentRule.constructor.name === "CSSScopeRule") {
 						nestedSelectorRule = styleRule;
 					}
-					
+
 					// Set __parentStyleSheet for the new nested styleRule
 					styleRule.__parentStyleSheet = styleSheet;
-					
+
 					// Update currentScope and parentRule to the new nested styleRule
 					// so that subsequent content (like @-rules) will be children of this rule
 					currentScope = parentRule = styleRule;
@@ -11208,7 +11283,7 @@ CSSOM.parse = function parse(token, opts, errorHandler) {
 							}
 
 							// Determine if we're closing a special nested selector context
-							var isClosingNestedSelectorContext = nestedSelectorRule && 
+							var isClosingNestedSelectorContext = nestedSelectorRule &&
 								(currentScope === nestedSelectorRule || nestedSelectorRule.__parentRule === currentScope);
 
 							if (isClosingNestedSelectorContext) {
@@ -11522,17 +11597,17 @@ var regexPatterns = {
 	forwardImportRuleValidationRegExp: forwardImportRuleValidationRegExp,
 	forwardRuleClosingBraceRegExp: forwardRuleClosingBraceRegExp,
 	forwardRuleSemicolonAndOpeningBraceRegExp: forwardRuleSemicolonAndOpeningBraceRegExp,
-	
+
 	// Selector validation patterns
 	cssCustomIdentifierRegExp: cssCustomIdentifierRegExp,
 	startsWithCombinatorRegExp: startsWithCombinatorRegExp,
 	atPageRuleSelectorRegExp: atPageRuleSelectorRegExp,
-	
+
 	// Parsing patterns used in CSSImportRule
 	layerRegExp: layerRegExp,
 	layerRuleNameRegExp: layerRuleNameRegExp,
 	doubleOrMoreSpacesRegExp: doubleOrMoreSpacesRegExp,
-	
+
 	// Escape sequence and identifier patterns
 	startsWithHexEscapeRegExp: startsWithHexEscapeRegExp,
 	identStartCharRegExp: identStartCharRegExp,
@@ -12154,8 +12229,8 @@ class OidcClient {
             const res = yield httpclient
                 .getJson(id_token_url)
                 .catch(error => {
-                throw new Error(`Failed to get ID Token. \n 
-        Error Code : ${error.statusCode}\n 
+                throw new Error(`Failed to get ID Token. \n
+        Error Code : ${error.statusCode}\n
         Error Message: ${error.message}`);
             });
             const id_token = (_a = res.result) === null || _a === void 0 ? void 0 : _a.value;
@@ -13654,7 +13729,7 @@ const Context = __importStar(__nccwpck_require__(99944));
 const Utils = __importStar(__nccwpck_require__(77276));
 // octokit + plugins
 const core_1 = __nccwpck_require__(7590);
-const plugin_rest_endpoint_methods_1 = __nccwpck_require__(33656);
+const plugin_rest_endpoint_methods_1 = __nccwpck_require__(33261);
 const plugin_paginate_rest_1 = __nccwpck_require__(71571);
 exports.context = new Context.Context();
 const baseUrl = Utils.getApiBaseUrl();
@@ -24837,7 +24912,7 @@ var import_v4 = __nccwpck_require__(4447);
 var mistralLanguageModelOptions = import_v4.z.object({
   /**
   Whether to inject a safety prompt before all conversations.
-  
+
   Defaults to `false`.
      */
   safePrompt: import_v4.z.boolean().optional(),
@@ -28552,7 +28627,7 @@ var openaiCompletionProviderOptions = (0, import_provider_utils7.lazySchema)(
       echo: import_v45.z.boolean().optional(),
       /**
       Modify the likelihood of specified tokens appearing in the completion.
-      
+
       Accepts a JSON object that maps tokens (specified by their token ID in
       the GPT tokenizer) to an associated bias value from -100 to 100. You
       can use this tokenizer tool to convert text to token IDs. Mathematically,
@@ -28560,7 +28635,7 @@ var openaiCompletionProviderOptions = (0, import_provider_utils7.lazySchema)(
       The exact effect will vary per model, but values between -1 and 1 should
       decrease or increase likelihood of selection; values like -100 or 100
       should result in a ban or exclusive selection of the relevant token.
-      
+
       As an example, you can pass {"50256": -100} to prevent the <|endoftext|>
       token from being generated.
        */
@@ -56701,7 +56776,7 @@ exports.createIncrementalHTMLParser = function() {
         document: function() {
           return parser.document();
         },
-    };  
+    };
 };
 
 exports.createWindow = function(html, address) {
@@ -59220,7 +59295,7 @@ paginateRest.VERSION = VERSION;
 
 /***/ }),
 
-/***/ 33656:
+/***/ 33261:
 /***/ ((module) => {
 
 "use strict";
@@ -63077,7 +63152,7 @@ class RunToolApprovalItem extends RunItemBase {
     agent;
     toolName;
     type = 'tool_approval_item';
-    constructor(rawItem, agent, 
+    constructor(rawItem, agent,
     /**
      * Explicit tool name to use for approval tracking when not present on the raw item.
      */
@@ -64883,7 +64958,7 @@ class Runner extends lifecycle_1.RunHooks {
     /**
      * @internal
      */
-    async #runIndividualNonStream(startingAgent, input, options, 
+    async #runIndividualNonStream(startingAgent, input, options,
     // sessionInputUpdate lets the caller adjust queued session items after filters run so we
     // persist exactly what we send to the model (e.g., after redactions or truncation).
     sessionInputUpdate, preserveTurnPersistenceOnResume) {
@@ -74437,7 +74512,7 @@ function readShape(input) {
 
 /***/ }),
 
-/***/ 94985:
+/***/ 76619:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 "use strict";
@@ -74504,7 +74579,7 @@ exports.CloudflareRealtimeTransportLayer = CloudflareRealtimeTransportLayer;
 
 /***/ }),
 
-/***/ 17088:
+/***/ 9474:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 "use strict";
@@ -74688,7 +74763,7 @@ exports.TwilioRealtimeTransportLayer = TwilioRealtimeTransportLayer;
 
 /***/ }),
 
-/***/ 86196:
+/***/ 58362:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 "use strict";
@@ -75905,7 +75980,7 @@ function toolChoiceToLanguageV2Format(toolChoice) {
 
 /***/ }),
 
-/***/ 35746:
+/***/ 61256:
 /***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
 
 "use strict";
@@ -75925,13 +76000,13 @@ var __exportStar = (this && this.__exportStar) || function(m, exports) {
     for (var p in m) if (p !== "default" && !Object.prototype.hasOwnProperty.call(exports, p)) __createBinding(exports, m, p);
 };
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-__exportStar(__nccwpck_require__(94985), exports);
-__exportStar(__nccwpck_require__(17088), exports);
+__exportStar(__nccwpck_require__(76619), exports);
+__exportStar(__nccwpck_require__(9474), exports);
 // Optional peer dependency: @ai-sdk/provider.
 // Kept for backward compatibility; prefer importing from "@openai/agents-extensions/ai-sdk".
 // If you see TypeScript errors without using aiSdk(), please install @ai-sdk/provider for now.
 // This re-export will be removed in v0.5.
-__exportStar(__nccwpck_require__(86196), exports);
+__exportStar(__nccwpck_require__(58362), exports);
 //# sourceMappingURL=index.js.map
 
 /***/ }),
@@ -79406,9 +79481,9 @@ function defineRealtimeOutputGuardrail({ policyHint: policyHintInput, ...options
  */
 function getRealtimeGuardrailFeedbackMessage(result) {
     return `
-⚠️ Your last answer was blocked. 
-Failed Guardrail Reason: ${result.guardrail.policyHint}. 
-Failure Details: ${JSON.stringify(result.output.outputInfo ?? {})}. 
+⚠️ Your last answer was blocked.
+Failed Guardrail Reason: ${result.guardrail.policyHint}.
+Failure Details: ${JSON.stringify(result.output.outputInfo ?? {})}.
 Please respond again following policy. Apologize for not being able to answer the question (while avoiding the specific reason) and divert discussion back to an approved topic immediately and not invite more discussion.
 `.trim();
 }
@@ -89822,7 +89897,7 @@ function removeHook(state, name, method) {
           var eosType = ref._eosType;
           /**
            * All the level runs in an isolating run sequence have the same embedding level.
-           * 
+           *
            * DO NOT change any `embedLevels[i]` within the current scope.
            */
           var embedDirection = ((embedLevels[seqIndices$1[0]]) & 1) ? TYPE_R : TYPE_L;
@@ -130263,7 +130338,7 @@ class SaxesParser {
         let { i: start } = this;
         const { chunk } = this;
         // eslint-disable-next-line no-labels, no-restricted-syntax
-        loop: 
+        loop:
         // eslint-disable-next-line no-constant-condition
         while (true) {
             switch (this.getCode()) {
@@ -130942,7 +131017,7 @@ class SaxesParser {
         let { i: start, forbiddenState } = this;
         const { chunk, textHandler: handler } = this;
         // eslint-disable-next-line no-labels, no-restricted-syntax
-        scanLoop: 
+        scanLoop:
         // eslint-disable-next-line no-constant-condition
         while (true) {
             switch (this.getCode()) {
@@ -131020,7 +131095,7 @@ class SaxesParser {
         const { chunk, textHandler: handler } = this;
         let nonSpace = false;
         // eslint-disable-next-line no-labels, no-restricted-syntax
-        outRootLoop: 
+        outRootLoop:
         // eslint-disable-next-line no-constant-condition
         while (true) {
             const code = this.getCode();
@@ -175582,7 +175657,7 @@ class Protocol {
         this.setNotificationHandler(types_js_1.ProgressNotificationSchema, notification => {
             this._onprogress(notification);
         });
-        this.setRequestHandler(types_js_1.PingRequestSchema, 
+        this.setRequestHandler(types_js_1.PingRequestSchema,
         // Automatic pong by default.
         _request => ({}));
         // Install task handlers if TaskStore is provided
@@ -289248,11 +289323,11 @@ class LRUCache {
             b.__abortController instanceof AC);
     }
     async fetch(k, fetchOptions = {}) {
-        const { 
+        const {
         // get options
-        allowStale = this.allowStale, updateAgeOnGet = this.updateAgeOnGet, noDeleteOnStaleGet = this.noDeleteOnStaleGet, 
+        allowStale = this.allowStale, updateAgeOnGet = this.updateAgeOnGet, noDeleteOnStaleGet = this.noDeleteOnStaleGet,
         // set options
-        ttl = this.ttl, noDisposeOnSet = this.noDisposeOnSet, size = 0, sizeCalculation = this.sizeCalculation, noUpdateTTL = this.noUpdateTTL, 
+        ttl = this.ttl, noDisposeOnSet = this.noDisposeOnSet, size = 0, sizeCalculation = this.sizeCalculation, noUpdateTTL = this.noUpdateTTL,
         // fetch exclusive options
         noDeleteOnFetchRejection = this.noDeleteOnFetchRejection, allowStaleOnFetchRejection = this.allowStaleOnFetchRejection, ignoreFetchAbort = this.ignoreFetchAbort, allowStaleOnFetchAbort = this.allowStaleOnFetchAbort, context, forceRefresh = false, status, signal, } = fetchOptions;
         if (!this.#hasFetchMethod) {
@@ -291838,7 +291913,7 @@ class OpenAI {
         catch (err) {
             if (err instanceof Errors.OpenAIError)
                 throw err;
-            throw new Errors.OpenAIError(`Failed to get token from 'apiKey' function: ${err.message}`, 
+            throw new Errors.OpenAIError(`Failed to get token from 'apiKey' function: ${err.message}`,
             // @ts-ignore
             { cause: err });
         }
@@ -293799,7 +293874,7 @@ function inner_stringify(object, prefix, generateArrayPrefix, commaRoundTrip, al
     }
     for (let j = 0; j < obj_keys.length; ++j) {
         const key = obj_keys[j];
-        const value = 
+        const value =
         // @ts-ignore
         typeof key === 'object' && typeof key.value !== 'undefined' ? key.value : obj[key];
         if (skipNulls && value === null) {
@@ -293815,7 +293890,7 @@ function inner_stringify(object, prefix, generateArrayPrefix, commaRoundTrip, al
         sideChannel.set(object, step);
         const valueSideChannel = new WeakMap();
         valueSideChannel.set(sentinel, sideChannel);
-        push_to_array(values, inner_stringify(value, key_prefix, generateArrayPrefix, commaRoundTrip, allowEmptyArrays, strictNullHandling, skipNulls, encodeDotInKeys, 
+        push_to_array(values, inner_stringify(value, key_prefix, generateArrayPrefix, commaRoundTrip, allowEmptyArrays, strictNullHandling, skipNulls, encodeDotInKeys,
         // @ts-ignore
         generateArrayPrefix === 'comma' && encodeValuesOnly && (0, values_1.isArray)(obj) ? null : encoder, filter, sort, allowDots, serializeDate, format, formatter, encodeValuesOnly, charset, valueSideChannel));
     }
@@ -293920,7 +293995,7 @@ function stringify(object, opts = {}) {
         if (options.skipNulls && obj[key] === null) {
             continue;
         }
-        push_to_array(keys, inner_stringify(obj[key], key, 
+        push_to_array(keys, inner_stringify(obj[key], key,
         // @ts-expect-error
         generateArrayPrefix, commaRoundTrip, options.allowEmptyArrays, options.strictNullHandling, options.skipNulls, options.encodeDotInKeys, options.encode ? options.encoder : null, options.filter, options.sort, options.allowDots, options.serializeDate, options.format, options.formatter, options.encodeValuesOnly, options.charset, sideChannel));
     }
@@ -302955,7 +303030,7 @@ __export(index_exports, {
 module.exports = __toCommonJS(index_exports);
 
 // src/js/css-calc.ts
-var import_css_calc4 = __nccwpck_require__(18941);
+var import_css_calc4 = __nccwpck_require__(13646);
 var import_css_tokenizer4 = __nccwpck_require__(68929);
 
 // src/js/cache.ts
@@ -305996,8 +306071,8 @@ var cssVar = (value, opt = {}) => {
 };
 
 // src/js/relative-color.ts
-var import_css_color_parser = __nccwpck_require__(38772);
-var import_css_parser_algorithms = __nccwpck_require__(69002);
+var import_css_color_parser = __nccwpck_require__(20243);
+var import_css_parser_algorithms = __nccwpck_require__(85181);
 var import_css_tokenizer2 = __nccwpck_require__(68929);
 var {
   CloseParen: PAREN_CLOSE2,
@@ -313579,25 +313654,25 @@ var n;return _=[lin_a98rgb_channel((n=_)[0]),lin_a98rgb_channel(n[1]),lin_a98rgb
 
 /***/ }),
 
-/***/ 18941:
+/***/ 13646:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 "use strict";
-var e=__nccwpck_require__(69002),n=__nccwpck_require__(68929);const t=/[A-Z]/g;function toLowerCaseAZ(e){return e.replace(t,(e=>String.fromCharCode(e.charCodeAt(0)+32)))}const o={cm:"px",in:"px",mm:"px",pc:"px",pt:"px",px:"px",q:"px",deg:"deg",grad:"deg",rad:"deg",turn:"deg",ms:"s",s:"s",hz:"hz",khz:"hz"},r=new Map([["cm",e=>e],["mm",e=>10*e],["q",e=>40*e],["in",e=>e/2.54],["pc",e=>e/2.54*6],["pt",e=>e/2.54*72],["px",e=>e/2.54*96]]),i=new Map([["deg",e=>e],["grad",e=>e/.9],["rad",e=>e/180*Math.PI],["turn",e=>e/360]]),u=new Map([["deg",e=>.9*e],["grad",e=>e],["rad",e=>.9*e/180*Math.PI],["turn",e=>.9*e/360]]),a=new Map([["hz",e=>e],["khz",e=>e/1e3]]),s=new Map([["cm",e=>2.54*e],["mm",e=>25.4*e],["q",e=>25.4*e*4],["in",e=>e],["pc",e=>6*e],["pt",e=>72*e],["px",e=>96*e]]),l=new Map([["hz",e=>1e3*e],["khz",e=>e]]),c=new Map([["cm",e=>e/10],["mm",e=>e],["q",e=>4*e],["in",e=>e/25.4],["pc",e=>e/25.4*6],["pt",e=>e/25.4*72],["px",e=>e/25.4*96]]),m=new Map([["ms",e=>e],["s",e=>e/1e3]]),v=new Map([["cm",e=>e/6*2.54],["mm",e=>e/6*25.4],["q",e=>e/6*25.4*4],["in",e=>e/6],["pc",e=>e],["pt",e=>e/6*72],["px",e=>e/6*96]]),T=new Map([["cm",e=>e/72*2.54],["mm",e=>e/72*25.4],["q",e=>e/72*25.4*4],["in",e=>e/72],["pc",e=>e/72*6],["pt",e=>e],["px",e=>e/72*96]]),p=new Map([["cm",e=>e/96*2.54],["mm",e=>e/96*25.4],["q",e=>e/96*25.4*4],["in",e=>e/96],["pc",e=>e/96*6],["pt",e=>e/96*72],["px",e=>e]]),N=new Map([["cm",e=>e/4/10],["mm",e=>e/4],["q",e=>e],["in",e=>e/4/25.4],["pc",e=>e/4/25.4*6],["pt",e=>e/4/25.4*72],["px",e=>e/4/25.4*96]]),f=new Map([["deg",e=>180*e/Math.PI],["grad",e=>180*e/Math.PI/.9],["rad",e=>e],["turn",e=>180*e/Math.PI/360]]),d=new Map([["ms",e=>1e3*e],["s",e=>e]]),k=new Map([["deg",e=>360*e],["grad",e=>360*e/.9],["rad",e=>360*e/180*Math.PI],["turn",e=>e]]),C=new Map([["cm",r],["mm",c],["q",N],["in",s],["pc",v],["pt",T],["px",p],["ms",m],["s",d],["deg",i],["grad",u],["rad",f],["turn",k],["hz",a],["khz",l]]);function convertUnit(e,t){if(!n.isTokenDimension(e))return t;if(!n.isTokenDimension(t))return t;const o=toLowerCaseAZ(e[4].unit),r=toLowerCaseAZ(t[4].unit);if(o===r)return t;const i=C.get(r);if(!i)return t;const u=i.get(o);if(!u)return t;const a=u(t[4].value),s=[n.TokenType.Dimension,"",t[2],t[3],{...t[4],signCharacter:a<0?"-":void 0,type:Number.isInteger(a)?n.NumberType.Integer:n.NumberType.Number,value:a}];return n.mutateUnit(s,e[4].unit),s}function toCanonicalUnit(e){if(!n.isTokenDimension(e))return e;const t=toLowerCaseAZ(e[4].unit),r=o[t];if(t===r)return e;const i=C.get(t);if(!i)return e;const u=i.get(r);if(!u)return e;const a=u(e[4].value),s=[n.TokenType.Dimension,"",e[2],e[3],{...e[4],signCharacter:a<0?"-":void 0,type:Number.isInteger(a)?n.NumberType.Integer:n.NumberType.Number,value:a}];return n.mutateUnit(s,r),s}function addition(t){if(2!==t.length)return-1;const o=t[0].value;let r=t[1].value;if(n.isTokenNumber(o)&&n.isTokenNumber(r)){const t=o[4].value+r[4].value;return new e.TokenNode([n.TokenType.Number,t.toString(),o[2],r[3],{value:t,type:o[4].type===n.NumberType.Integer&&r[4].type===n.NumberType.Integer?n.NumberType.Integer:n.NumberType.Number}])}if(n.isTokenPercentage(o)&&n.isTokenPercentage(r)){const t=o[4].value+r[4].value;return new e.TokenNode([n.TokenType.Percentage,t.toString()+"%",o[2],r[3],{value:t}])}if(n.isTokenDimension(o)&&n.isTokenDimension(r)&&(r=convertUnit(o,r),toLowerCaseAZ(o[4].unit)===toLowerCaseAZ(r[4].unit))){const t=o[4].value+r[4].value;return new e.TokenNode([n.TokenType.Dimension,t.toString()+o[4].unit,o[2],r[3],{value:t,type:o[4].type===n.NumberType.Integer&&r[4].type===n.NumberType.Integer?n.NumberType.Integer:n.NumberType.Number,unit:o[4].unit}])}return-1}function division(t){if(2!==t.length)return-1;const o=t[0].value,r=t[1].value;if(n.isTokenNumber(o)&&n.isTokenNumber(r)){const t=o[4].value/r[4].value;return new e.TokenNode([n.TokenType.Number,t.toString(),o[2],r[3],{value:t,type:Number.isInteger(t)?n.NumberType.Integer:n.NumberType.Number}])}if(n.isTokenPercentage(o)&&n.isTokenNumber(r)){const t=o[4].value/r[4].value;return new e.TokenNode([n.TokenType.Percentage,t.toString()+"%",o[2],r[3],{value:t}])}if(n.isTokenDimension(o)&&n.isTokenNumber(r)){const t=o[4].value/r[4].value;return new e.TokenNode([n.TokenType.Dimension,t.toString()+o[4].unit,o[2],r[3],{value:t,type:Number.isInteger(t)?n.NumberType.Integer:n.NumberType.Number,unit:o[4].unit}])}return-1}function isCalculation(e){return!!e&&"object"==typeof e&&"inputs"in e&&Array.isArray(e.inputs)&&"operation"in e}function solve(n){if(-1===n)return-1;const t=[];for(let o=0;o<n.inputs.length;o++){const r=n.inputs[o];if(e.isTokenNode(r)){t.push(r);continue}const i=solve(r);if(-1===i)return-1;t.push(i)}return n.operation(t)}function multiplication(t){if(2!==t.length)return-1;const o=t[0].value,r=t[1].value;if(n.isTokenNumber(o)&&n.isTokenNumber(r)){const t=o[4].value*r[4].value;return new e.TokenNode([n.TokenType.Number,t.toString(),o[2],r[3],{value:t,type:o[4].type===n.NumberType.Integer&&r[4].type===n.NumberType.Integer?n.NumberType.Integer:n.NumberType.Number}])}if(n.isTokenPercentage(o)&&n.isTokenNumber(r)){const t=o[4].value*r[4].value;return new e.TokenNode([n.TokenType.Percentage,t.toString()+"%",o[2],r[3],{value:t}])}if(n.isTokenNumber(o)&&n.isTokenPercentage(r)){const t=o[4].value*r[4].value;return new e.TokenNode([n.TokenType.Percentage,t.toString()+"%",o[2],r[3],{value:t}])}if(n.isTokenDimension(o)&&n.isTokenNumber(r)){const t=o[4].value*r[4].value;return new e.TokenNode([n.TokenType.Dimension,t.toString()+o[4].unit,o[2],r[3],{value:t,type:o[4].type===n.NumberType.Integer&&r[4].type===n.NumberType.Integer?n.NumberType.Integer:n.NumberType.Number,unit:o[4].unit}])}if(n.isTokenNumber(o)&&n.isTokenDimension(r)){const t=o[4].value*r[4].value;return new e.TokenNode([n.TokenType.Dimension,t.toString()+r[4].unit,o[2],r[3],{value:t,type:o[4].type===n.NumberType.Integer&&r[4].type===n.NumberType.Integer?n.NumberType.Integer:n.NumberType.Number,unit:r[4].unit}])}return-1}function resolveGlobalsAndConstants(t,o){for(let r=0;r<t.length;r++){const i=t[r];if(!e.isTokenNode(i))continue;const u=i.value;if(!n.isTokenIdent(u))continue;const a=toLowerCaseAZ(u[4].value);switch(a){case"e":t.splice(r,1,new e.TokenNode([n.TokenType.Number,Math.E.toString(),u[2],u[3],{value:Math.E,type:n.NumberType.Number}]));break;case"pi":t.splice(r,1,new e.TokenNode([n.TokenType.Number,Math.PI.toString(),u[2],u[3],{value:Math.PI,type:n.NumberType.Number}]));break;case"infinity":t.splice(r,1,new e.TokenNode([n.TokenType.Number,"infinity",u[2],u[3],{value:1/0,type:n.NumberType.Number}]));break;case"-infinity":t.splice(r,1,new e.TokenNode([n.TokenType.Number,"-infinity",u[2],u[3],{value:-1/0,type:n.NumberType.Number}]));break;case"nan":t.splice(r,1,new e.TokenNode([n.TokenType.Number,"NaN",u[2],u[3],{value:Number.NaN,type:n.NumberType.Number}]));break;default:if(o.has(a)){const n=o.get(a);t.splice(r,1,new e.TokenNode(n))}}}return t}function unary(e){if(1!==e.length)return-1;const t=e[0].value;return n.isTokenNumeric(t)?e[0]:-1}function resultToCalculation(e,t,o){return n.isTokenDimension(t)?dimensionToCalculation(e,t[4].unit,o):n.isTokenPercentage(t)?percentageToCalculation(e,o):n.isTokenNumber(t)?numberToCalculation(e,o):-1}function dimensionToCalculation(t,o,r){const i=t.tokens();return{inputs:[new e.TokenNode([n.TokenType.Dimension,r.toString()+o,i[0][2],i[i.length-1][3],{value:r,type:Number.isInteger(r)?n.NumberType.Integer:n.NumberType.Number,unit:o}])],operation:unary}}function percentageToCalculation(t,o){const r=t.tokens();return{inputs:[new e.TokenNode([n.TokenType.Percentage,o.toString()+"%",r[0][2],r[r.length-1][3],{value:o}])],operation:unary}}function numberToCalculation(t,o){const r=t.tokens();return{inputs:[new e.TokenNode([n.TokenType.Number,o.toString(),r[0][2],r[r.length-1][3],{value:o,type:Number.isInteger(o)?n.NumberType.Integer:n.NumberType.Number}])],operation:unary}}function solveACos(e,t){const o=t.value;if(!n.isTokenNumber(o))return-1;return dimensionToCalculation(e,"rad",Math.acos(o[4].value))}function solveASin(e,t){const o=t.value;if(!n.isTokenNumber(o))return-1;return dimensionToCalculation(e,"rad",Math.asin(o[4].value))}function solveATan(e,t){const o=t.value;if(!n.isTokenNumber(o))return-1;return dimensionToCalculation(e,"rad",Math.atan(o[4].value))}function isDimensionOrNumber(e){return n.isTokenDimension(e)||n.isTokenNumber(e)}function arrayOfSameNumeric(e){if(0===e.length)return!0;const t=e[0];if(!n.isTokenNumeric(t))return!1;if(1===e.length)return!0;if(n.isTokenDimension(t)){const n=toLowerCaseAZ(t[4].unit);for(let o=1;o<e.length;o++){const r=e[o];if(t[0]!==r[0])return!1;if(n!==toLowerCaseAZ(r[4].unit))return!1}return!0}for(let n=1;n<e.length;n++){const o=e[n];if(t[0]!==o[0])return!1}return!0}function twoOfSameNumeric(e,t){return!!n.isTokenNumeric(e)&&(n.isTokenDimension(e)?e[0]===t[0]&&toLowerCaseAZ(e[4].unit)===toLowerCaseAZ(t[4].unit):e[0]===t[0])}function solveATan2(e,n,t){const o=n.value;if(!isDimensionOrNumber(o))return-1;const r=convertUnit(o,t.value);if(!twoOfSameNumeric(o,r))return-1;return dimensionToCalculation(e,"rad",Math.atan2(o[4].value,r[4].value))}function solveAbs(e,t,o){const r=t.value;if(!n.isTokenNumeric(r))return-1;if(!o.rawPercentages&&n.isTokenPercentage(r))return-1;return resultToCalculation(e,r,Math.abs(r[4].value))}function solveClamp(t,o,r,i,u){if(!e.isTokenNode(o)||!e.isTokenNode(r)||!e.isTokenNode(i))return-1;const a=o.value;if(!n.isTokenNumeric(a))return-1;if(!u.rawPercentages&&n.isTokenPercentage(a))return-1;const s=convertUnit(a,r.value);if(!twoOfSameNumeric(a,s))return-1;const l=convertUnit(a,i.value);if(!twoOfSameNumeric(a,l))return-1;return resultToCalculation(t,a,Math.max(a[4].value,Math.min(s[4].value,l[4].value)))}function solveCos(e,t){const o=t.value;if(!isDimensionOrNumber(o))return-1;let r=o[4].value;if(n.isTokenDimension(o))switch(o[4].unit.toLowerCase()){case"rad":break;case"deg":r=i.get("rad")(o[4].value);break;case"grad":r=u.get("rad")(o[4].value);break;case"turn":r=k.get("rad")(o[4].value);break;default:return-1}return r=Math.cos(r),numberToCalculation(e,r)}function solveExp(e,t){const o=t.value;if(!n.isTokenNumber(o))return-1;return numberToCalculation(e,Math.exp(o[4].value))}function solveHypot(t,o,r){if(!o.every(e.isTokenNode))return-1;const i=o[0].value;if(!n.isTokenNumeric(i))return-1;if(!r.rawPercentages&&n.isTokenPercentage(i))return-1;const u=o.map((e=>convertUnit(i,e.value)));if(!arrayOfSameNumeric(u))return-1;const a=u.map((e=>e[4].value)),s=Math.hypot(...a);return resultToCalculation(t,i,s)}function solveMax(t,o,r){if(!o.every(e.isTokenNode))return-1;const i=o[0].value;if(!n.isTokenNumeric(i))return-1;if(!r.rawPercentages&&n.isTokenPercentage(i))return-1;const u=o.map((e=>convertUnit(i,e.value)));if(!arrayOfSameNumeric(u))return-1;const a=u.map((e=>e[4].value)),s=Math.max(...a);return resultToCalculation(t,i,s)}function solveMin(t,o,r){if(!o.every(e.isTokenNode))return-1;const i=o[0].value;if(!n.isTokenNumeric(i))return-1;if(!r.rawPercentages&&n.isTokenPercentage(i))return-1;const u=o.map((e=>convertUnit(i,e.value)));if(!arrayOfSameNumeric(u))return-1;const a=u.map((e=>e[4].value)),s=Math.min(...a);return resultToCalculation(t,i,s)}function solveMod(e,t,o){const r=t.value;if(!n.isTokenNumeric(r))return-1;const i=convertUnit(r,o.value);if(!twoOfSameNumeric(r,i))return-1;let u;return u=0===i[4].value?Number.NaN:Number.isFinite(r[4].value)&&(Number.isFinite(i[4].value)||(i[4].value!==Number.POSITIVE_INFINITY||r[4].value!==Number.NEGATIVE_INFINITY&&!Object.is(0*r[4].value,-0))&&(i[4].value!==Number.NEGATIVE_INFINITY||r[4].value!==Number.POSITIVE_INFINITY&&!Object.is(0*r[4].value,0)))?Number.isFinite(i[4].value)?(r[4].value%i[4].value+i[4].value)%i[4].value:r[4].value:Number.NaN,resultToCalculation(e,r,u)}function solvePow(e,t,o){const r=t.value,i=o.value;if(!n.isTokenNumber(r))return-1;if(!twoOfSameNumeric(r,i))return-1;return numberToCalculation(e,Math.pow(r[4].value,i[4].value))}function solveRem(e,t,o){const r=t.value;if(!n.isTokenNumeric(r))return-1;const i=convertUnit(r,o.value);if(!twoOfSameNumeric(r,i))return-1;let u;return u=0===i[4].value?Number.NaN:Number.isFinite(r[4].value)?Number.isFinite(i[4].value)?r[4].value%i[4].value:r[4].value:Number.NaN,resultToCalculation(e,r,u)}function solveRound(e,t,o,r,i){const u=o.value;if(!n.isTokenNumeric(u))return-1;if(!i.rawPercentages&&n.isTokenPercentage(u))return-1;const a=convertUnit(u,r.value);if(!twoOfSameNumeric(u,a))return-1;let s;if(0===a[4].value)s=Number.NaN;else if(Number.isFinite(u[4].value)||Number.isFinite(a[4].value))if(!Number.isFinite(u[4].value)&&Number.isFinite(a[4].value))s=u[4].value;else if(Number.isFinite(u[4].value)&&!Number.isFinite(a[4].value))switch(t){case"down":s=u[4].value<0?-1/0:Object.is(-0,0*u[4].value)?-0:0;break;case"up":s=u[4].value>0?1/0:Object.is(0,0*u[4].value)?0:-0;break;default:s=Object.is(0,0*u[4].value)?0:-0}else if(Number.isFinite(a[4].value))switch(t){case"down":s=Math.floor(u[4].value/a[4].value)*a[4].value;break;case"up":s=Math.ceil(u[4].value/a[4].value)*a[4].value;break;case"to-zero":s=Math.trunc(u[4].value/a[4].value)*a[4].value;break;default:{let e=Math.floor(u[4].value/a[4].value)*a[4].value,n=Math.ceil(u[4].value/a[4].value)*a[4].value;if(e>n){const t=e;e=n,n=t}const t=Math.abs(u[4].value-e),o=Math.abs(u[4].value-n);s=t===o?n:t<o?e:n;break}}else s=u[4].value;else s=Number.NaN;return resultToCalculation(e,u,s)}function solveSign(e,t,o){const r=t.value;if(!n.isTokenNumeric(r))return-1;if(!o.rawPercentages&&n.isTokenPercentage(r))return-1;return numberToCalculation(e,Math.sign(r[4].value))}function solveSin(e,t){const o=t.value;if(!isDimensionOrNumber(o))return-1;let r=o[4].value;if(n.isTokenDimension(o))switch(toLowerCaseAZ(o[4].unit)){case"rad":break;case"deg":r=i.get("rad")(o[4].value);break;case"grad":r=u.get("rad")(o[4].value);break;case"turn":r=k.get("rad")(o[4].value);break;default:return-1}return r=Math.sin(r),numberToCalculation(e,r)}function solveSqrt(e,t){const o=t.value;if(!n.isTokenNumber(o))return-1;return numberToCalculation(e,Math.sqrt(o[4].value))}function solveTan(e,t){const o=t.value;if(!isDimensionOrNumber(o))return-1;const r=o[4].value;let a=0,s=o[4].value;if(n.isTokenDimension(o))switch(toLowerCaseAZ(o[4].unit)){case"rad":a=f.get("deg")(r);break;case"deg":a=r,s=i.get("rad")(r);break;case"grad":a=u.get("deg")(r),s=u.get("rad")(r);break;case"turn":a=k.get("deg")(r),s=k.get("rad")(r);break;default:return-1}const l=a/90;return s=a%90==0&&l%2!=0?l>0?1/0:-1/0:Math.tan(s),numberToCalculation(e,s)}function subtraction(t){if(2!==t.length)return-1;const o=t[0].value;let r=t[1].value;if(n.isTokenNumber(o)&&n.isTokenNumber(r)){const t=o[4].value-r[4].value;return new e.TokenNode([n.TokenType.Number,t.toString(),o[2],r[3],{value:t,type:o[4].type===n.NumberType.Integer&&r[4].type===n.NumberType.Integer?n.NumberType.Integer:n.NumberType.Number}])}if(n.isTokenPercentage(o)&&n.isTokenPercentage(r)){const t=o[4].value-r[4].value;return new e.TokenNode([n.TokenType.Percentage,t.toString()+"%",o[2],r[3],{value:t}])}if(n.isTokenDimension(o)&&n.isTokenDimension(r)&&(r=convertUnit(o,r),toLowerCaseAZ(o[4].unit)===toLowerCaseAZ(r[4].unit))){const t=o[4].value-r[4].value;return new e.TokenNode([n.TokenType.Dimension,t.toString()+o[4].unit,o[2],r[3],{value:t,type:o[4].type===n.NumberType.Integer&&r[4].type===n.NumberType.Integer?n.NumberType.Integer:n.NumberType.Number,unit:o[4].unit}])}return-1}function solveLog(t,o){if(1===o.length){const r=o[0];if(!r||!e.isTokenNode(r))return-1;const i=r.value;if(!n.isTokenNumber(i))return-1;return numberToCalculation(t,Math.log(i[4].value))}if(2===o.length){const r=o[0];if(!r||!e.isTokenNode(r))return-1;const i=r.value;if(!n.isTokenNumber(i))return-1;const u=o[1];if(!u||!e.isTokenNode(u))return-1;const a=u.value;if(!n.isTokenNumber(a))return-1;return numberToCalculation(t,Math.log(i[4].value)/Math.log(a[4].value))}return-1}const g=/^none$/i;function isNone(t){if(Array.isArray(t)){const n=t.filter((n=>!(e.isWhitespaceNode(n)&&e.isCommentNode(n))));return 1===n.length&&isNone(n[0])}if(!e.isTokenNode(t))return!1;const o=t.value;return!!n.isTokenIdent(o)&&g.test(o[4].value)}const D=String.fromCodePoint(0);function solveRandom(e,t,o,r,i,u){if(-1===t.fixed&&!u.randomCaching)return-1;u.randomCaching||(u.randomCaching={propertyName:"",propertyN:0,elementID:"",documentID:""}),u.randomCaching&&!u.randomCaching.propertyN&&(u.randomCaching.propertyN=0);const a=o.value;if(!n.isTokenNumeric(a))return-1;const s=convertUnit(a,r.value);if(!twoOfSameNumeric(a,s))return-1;let l=null;if(i&&(l=convertUnit(a,i.value),!twoOfSameNumeric(a,l)))return-1;if(!Number.isFinite(a[4].value))return resultToCalculation(e,a,Number.NaN);if(!Number.isFinite(s[4].value))return resultToCalculation(e,a,Number.NaN);if(!Number.isFinite(s[4].value-a[4].value))return resultToCalculation(e,a,Number.NaN);if(l&&!Number.isFinite(l[4].value))return resultToCalculation(e,a,a[4].value);const c=-1===t.fixed?sfc32(crc32([t.dashedIdent?t.dashedIdent:`${u.randomCaching?.propertyName} ${u.randomCaching.propertyN++}`,t.elementShared?"":u.randomCaching.elementID,u.randomCaching.documentID].join(D))):()=>t.fixed;let m=a[4].value,v=s[4].value;if(m>v&&([m,v]=[v,m]),l&&(l[4].value<=0||Math.abs(m-v)/l[4].value>1e10)&&(l=null),l){const n=Math.max(l[4].value/1e3,1e-9),t=[m];let o=0;for(;;){o+=l[4].value;const e=m+o;if(!(e+n<v)){t.push(v);break}if(t.push(e),e+l[4].value-n>v)break}const r=c();return resultToCalculation(e,a,Number(t[Math.floor(t.length*r)].toFixed(5)))}const T=c();return resultToCalculation(e,a,Number((T*(v-m)+m).toFixed(5)))}function sfc32(e=.34944106645296036,n=.19228640875738723,t=.8784393832007205,o=.04850964319275053){return()=>{const r=((e|=0)+(n|=0)|0)+(o|=0)|0;return o=o+1|0,e=n^n>>>9,n=(t|=0)+(t<<3)|0,t=(t=t<<21|t>>>11)+r|0,(r>>>0)/4294967296}}function crc32(e){let n=0,t=0,o=0;n^=-1;for(let r=0,i=e.length;r<i;r++)o=255&(n^e.charCodeAt(r)),t=Number("0x"+"00000000 77073096 EE0E612C 990951BA 076DC419 706AF48F E963A535 9E6495A3 0EDB8832 79DCB8A4 E0D5E91E 97D2D988 09B64C2B 7EB17CBD E7B82D07 90BF1D91 1DB71064 6AB020F2 F3B97148 84BE41DE 1ADAD47D 6DDDE4EB F4D4B551 83D385C7 136C9856 646BA8C0 FD62F97A 8A65C9EC 14015C4F 63066CD9 FA0F3D63 8D080DF5 3B6E20C8 4C69105E D56041E4 A2677172 3C03E4D1 4B04D447 D20D85FD A50AB56B 35B5A8FA 42B2986C DBBBC9D6 ACBCF940 32D86CE3 45DF5C75 DCD60DCF ABD13D59 26D930AC 51DE003A C8D75180 BFD06116 21B4F4B5 56B3C423 CFBA9599 B8BDA50F 2802B89E 5F058808 C60CD9B2 B10BE924 2F6F7C87 58684C11 C1611DAB B6662D3D 76DC4190 01DB7106 98D220BC EFD5102A 71B18589 06B6B51F 9FBFE4A5 E8B8D433 7807C9A2 0F00F934 9609A88E E10E9818 7F6A0DBB 086D3D2D 91646C97 E6635C01 6B6B51F4 1C6C6162 856530D8 F262004E 6C0695ED 1B01A57B 8208F4C1 F50FC457 65B0D9C6 12B7E950 8BBEB8EA FCB9887C 62DD1DDF 15DA2D49 8CD37CF3 FBD44C65 4DB26158 3AB551CE A3BC0074 D4BB30E2 4ADFA541 3DD895D7 A4D1C46D D3D6F4FB 4369E96A 346ED9FC AD678846 DA60B8D0 44042D73 33031DE5 AA0A4C5F DD0D7CC9 5005713C 270241AA BE0B1010 C90C2086 5768B525 206F85B3 B966D409 CE61E49F 5EDEF90E 29D9C998 B0D09822 C7D7A8B4 59B33D17 2EB40D81 B7BD5C3B C0BA6CAD EDB88320 9ABFB3B6 03B6E20C 74B1D29A EAD54739 9DD277AF 04DB2615 73DC1683 E3630B12 94643B84 0D6D6A3E 7A6A5AA8 E40ECF0B 9309FF9D 0A00AE27 7D079EB1 F00F9344 8708A3D2 1E01F268 6906C2FE F762575D 806567CB 196C3671 6E6B06E7 FED41B76 89D32BE0 10DA7A5A 67DD4ACC F9B9DF6F 8EBEEFF9 17B7BE43 60B08ED5 D6D6A3E8 A1D1937E 38D8C2C4 4FDFF252 D1BB67F1 A6BC5767 3FB506DD 48B2364B D80D2BDA AF0A1B4C 36034AF6 41047A60 DF60EFC3 A867DF55 316E8EEF 4669BE79 CB61B38C BC66831A 256FD2A0 5268E236 CC0C7795 BB0B4703 220216B9 5505262F C5BA3BBE B2BD0B28 2BB45A92 5CB36A04 C2D7FFA7 B5D0CF31 2CD99E8B 5BDEAE1D 9B64C2B0 EC63F226 756AA39C 026D930A 9C0906A9 EB0E363F 72076785 05005713 95BF4A82 E2B87A14 7BB12BAE 0CB61B38 92D28E9B E5D5BE0D 7CDCEFB7 0BDBDF21 86D3D2D4 F1D4E242 68DDB3F8 1FDA836E 81BE16CD F6B9265B 6FB077E1 18B74777 88085AE6 FF0F6A70 66063BCA 11010B5C 8F659EFF F862AE69 616BFFD3 166CCF45 A00AE278 D70DD2EE 4E048354 3903B3C2 A7672661 D06016F7 4969474D 3E6E77DB AED16A4A D9D65ADC 40DF0B66 37D83BF0 A9BCAE53 DEBB9EC5 47B2CF7F 30B5FFE9 BDBDF21C CABAC28A 53B39330 24B4A3A6 BAD03605 CDD70693 54DE5729 23D967BF B3667A2E C4614AB8 5D681B02 2A6F2B94 B40BBE37 C30C8EA1 5A05DF1B 2D02EF8D".substring(9*o,9*o+8)),n=n>>>8^t;return(-1^n)>>>0}const b=new Map([["abs",function abs(e,n,t){return singleNodeSolver(e,n,t,solveAbs)}],["acos",function acos(e,n,t){return singleNodeSolver(e,n,t,solveACos)}],["asin",function asin(e,n,t){return singleNodeSolver(e,n,t,solveASin)}],["atan",function atan(e,n,t){return singleNodeSolver(e,n,t,solveATan)}],["atan2",function atan2(e,n,t){return twoCommaSeparatedNodesSolver(e,n,t,solveATan2)}],["calc",calc$1],["clamp",function clamp(t,o,r){const i=resolveGlobalsAndConstants([...t.value.filter((n=>!e.isWhiteSpaceOrCommentNode(n)))],o),u=[],a=[],s=[];{let t=u;for(let o=0;o<i.length;o++){const r=i[o];if(e.isTokenNode(r)&&n.isTokenComma(r.value)){if(t===s)return-1;if(t===a){t=s;continue}if(t===u){t=a;continue}return-1}t.push(r)}}const l=isNone(u),c=isNone(s);if(l&&c)return calc$1(calcWrapper(a),o,r);const m=solve(calc$1(calcWrapper(a),o,r));if(-1===m)return-1;if(l){const t=solve(calc$1(calcWrapper(s),o,r));return-1===t?-1:solveMin((v=m,T=t,new e.FunctionNode([n.TokenType.Function,"min(",-1,-1,{value:"min"}],[n.TokenType.CloseParen,")",-1,-1,void 0],[v,new e.TokenNode([n.TokenType.Comma,",",-1,-1,void 0]),T])),[m,t],r)}if(c){const e=solve(calc$1(calcWrapper(u),o,r));return-1===e?-1:solveMax(maxWrapper(e,m),[e,m],r)}var v,T;const p=solve(calc$1(calcWrapper(u),o,r));if(-1===p)return-1;const N=solve(calc$1(calcWrapper(s),o,r));if(-1===N)return-1;return solveClamp(t,p,m,N,r)}],["cos",function cos(e,n,t){return singleNodeSolver(e,n,t,solveCos)}],["exp",function exp(e,n,t){return singleNodeSolver(e,n,t,solveExp)}],["hypot",function hypot(e,n,t){return variadicNodesSolver(e,e.value,n,t,solveHypot)}],["log",function log(e,n,t){return variadicNodesSolver(e,e.value,n,t,solveLog)}],["max",function max(e,n,t){return variadicNodesSolver(e,e.value,n,t,solveMax)}],["min",function min(e,n,t){return variadicNodesSolver(e,e.value,n,t,solveMin)}],["mod",function mod(e,n,t){return twoCommaSeparatedNodesSolver(e,n,t,solveMod)}],["pow",function pow(e,n,t){return twoCommaSeparatedNodesSolver(e,n,t,solvePow)}],["random",function random(n,t,o){const r=parseRandomValueSharing(n.value.filter((n=>!e.isWhiteSpaceOrCommentNode(n))),t,o);if(-1===r)return-1;const[i,u]=r,a=variadicArguments(u,t,o);if(-1===a)return-1;const[s,l,c]=a;if(!s||!l)return-1;return solveRandom(n,i,s,l,c,o)}],["rem",function rem(e,n,t){return twoCommaSeparatedNodesSolver(e,n,t,solveRem)}],["round",function round(t,o,r){const i=resolveGlobalsAndConstants([...t.value.filter((n=>!e.isWhiteSpaceOrCommentNode(n)))],o);let u="",a=!1;const s=[],l=[];{let t=s;for(let o=0;o<i.length;o++){const r=i[o];if(!u&&0===s.length&&0===l.length&&e.isTokenNode(r)&&n.isTokenIdent(r.value)){const e=r.value[4].value.toLowerCase();if(y.has(e)){u=e;continue}}if(e.isTokenNode(r)&&n.isTokenComma(r.value)){if(t===l)return-1;if(t===s&&u&&0===s.length)continue;if(t===s){a=!0,t=l;continue}return-1}t.push(r)}}const c=solve(calc$1(calcWrapper(s),o,r));if(-1===c)return-1;a||0!==l.length||l.push(new e.TokenNode([n.TokenType.Number,"1",-1,-1,{value:1,type:n.NumberType.Integer}]));const m=solve(calc$1(calcWrapper(l),o,r));if(-1===m)return-1;u||(u="nearest");return solveRound(t,u,c,m,r)}],["sign",function sign(e,n,t){return singleNodeSolver(e,n,t,solveSign)}],["sin",function sin(e,n,t){return singleNodeSolver(e,n,t,solveSin)}],["sqrt",function sqrt(e,n,t){return singleNodeSolver(e,n,t,solveSqrt)}],["tan",function tan(e,n,t){return singleNodeSolver(e,n,t,solveTan)}]]);function calc$1(t,o,r){const i=resolveGlobalsAndConstants([...t.value.filter((n=>!e.isWhiteSpaceOrCommentNode(n)))],o);if(1===i.length&&e.isTokenNode(i[0]))return{inputs:[i[0]],operation:unary};let u=0;for(;u<i.length;){const t=i[u];if(e.isSimpleBlockNode(t)&&n.isTokenOpenParen(t.startToken)){const e=calc$1(t,o,r);if(-1===e)return-1;i.splice(u,1,e)}else if(e.isFunctionNode(t)){const e=b.get(t.getName().toLowerCase());if(!e)return-1;const n=e(t,o,r);if(-1===n)return-1;i.splice(u,1,n)}else u++}if(u=0,1===i.length&&isCalculation(i[0]))return i[0];for(;u<i.length;){const t=i[u];if(!t||!e.isTokenNode(t)&&!isCalculation(t)){u++;continue}const o=i[u+1];if(!o||!e.isTokenNode(o)){u++;continue}const r=o.value;if(!n.isTokenDelim(r)||"*"!==r[4].value&&"/"!==r[4].value){u++;continue}const a=i[u+2];if(!a||!e.isTokenNode(a)&&!isCalculation(a))return-1;"*"!==r[4].value?"/"!==r[4].value?u++:i.splice(u,3,{inputs:[t,a],operation:division}):i.splice(u,3,{inputs:[t,a],operation:multiplication})}if(u=0,1===i.length&&isCalculation(i[0]))return i[0];for(;u<i.length;){const t=i[u];if(!t||!e.isTokenNode(t)&&!isCalculation(t)){u++;continue}const o=i[u+1];if(!o||!e.isTokenNode(o)){u++;continue}const r=o.value;if(!n.isTokenDelim(r)||"+"!==r[4].value&&"-"!==r[4].value){u++;continue}const a=i[u+2];if(!a||!e.isTokenNode(a)&&!isCalculation(a))return-1;"+"!==r[4].value?"-"!==r[4].value?u++:i.splice(u,3,{inputs:[t,a],operation:subtraction}):i.splice(u,3,{inputs:[t,a],operation:addition})}return 1===i.length&&isCalculation(i[0])?i[0]:-1}function singleNodeSolver(e,n,t,o){const r=singleArgument(e.value,n,t);return-1===r?-1:o(e,r,t)}function singleArgument(n,t,o){const r=solve(calc$1(calcWrapper(resolveGlobalsAndConstants([...n.filter((n=>!e.isWhiteSpaceOrCommentNode(n)))],t)),t,o));return-1===r?-1:r}function twoCommaSeparatedNodesSolver(e,n,t,o){const r=twoCommaSeparatedArguments(e.value,n,t);if(-1===r)return-1;const[i,u]=r;return o(e,i,u,t)}function twoCommaSeparatedArguments(t,o,r){const i=resolveGlobalsAndConstants([...t.filter((n=>!e.isWhiteSpaceOrCommentNode(n)))],o),u=[],a=[];{let t=u;for(let o=0;o<i.length;o++){const r=i[o];if(e.isTokenNode(r)&&n.isTokenComma(r.value)){if(t===a)return-1;if(t===u){t=a;continue}return-1}t.push(r)}}const s=solve(calc$1(calcWrapper(u),o,r));if(-1===s)return-1;const l=solve(calc$1(calcWrapper(a),o,r));return-1===l?-1:[s,l]}function variadicNodesSolver(e,n,t,o,r){const i=variadicArguments(e.value,t,o);return-1===i?-1:r(e,i,o)}function variadicArguments(t,o,r){const i=resolveGlobalsAndConstants([...t.filter((n=>!e.isWhiteSpaceOrCommentNode(n)))],o),u=[];{const t=[];let a=[];for(let o=0;o<i.length;o++){const r=i[o];e.isTokenNode(r)&&n.isTokenComma(r.value)?(t.push(a),a=[]):a.push(r)}t.push(a);for(let e=0;e<t.length;e++){if(0===t[e].length)return-1;const n=solve(calc$1(calcWrapper(t[e]),o,r));if(-1===n)return-1;u.push(n)}}return u}const y=new Set(["nearest","up","down","to-zero"]);function parseRandomValueSharing(t,o,r){const i={isAuto:!1,dashedIdent:"",fixed:-1,elementShared:!1},u=t[0];if(!e.isTokenNode(u)||!n.isTokenIdent(u.value))return[i,t];for(let u=0;u<t.length;u++){const a=t[u];if(!e.isTokenNode(a))return-1;if(n.isTokenComma(a.value))return[i,t.slice(u+1)];if(!n.isTokenIdent(a.value))return-1;const s=a.value[4].value.toLowerCase();if("element-shared"!==s)if("fixed"!==s)if("auto"!==s)if(s.startsWith("--")){if(-1!==i.fixed||i.isAuto)return-1;i.dashedIdent=s}else;else{if(-1!==i.fixed||i.dashedIdent)return-1;i.isAuto=!0}else{if(i.elementShared||i.dashedIdent||i.isAuto)return-1;u++;const e=t[u];if(!e)return-1;const a=solve(calc$1(calcWrapper([e]),o,r));if(-1===a)return-1;if(!n.isTokenNumber(a.value))return-1;if(a.value[4].value<0||a.value[4].value>1)return-1;i.fixed=Math.max(0,Math.min(a.value[4].value,1-1e-9))}else{if(-1!==i.fixed)return-1;i.elementShared=!0}}return-1}function calcWrapper(t){return new e.FunctionNode([n.TokenType.Function,"calc(",-1,-1,{value:"calc"}],[n.TokenType.CloseParen,")",-1,-1,void 0],t)}function maxWrapper(t,o){return new e.FunctionNode([n.TokenType.Function,"max(",-1,-1,{value:"max"}],[n.TokenType.CloseParen,")",-1,-1,void 0],[t,new e.TokenNode([n.TokenType.Comma,",",-1,-1,void 0]),o])}function patchNaN(t){if(-1===t)return-1;if(e.isFunctionNode(t))return t;const o=t.value;return n.isTokenNumeric(o)&&Number.isNaN(o[4].value)?n.isTokenNumber(o)?new e.FunctionNode([n.TokenType.Function,"calc(",o[2],o[3],{value:"calc"}],[n.TokenType.CloseParen,")",o[2],o[3],void 0],[new e.TokenNode([n.TokenType.Ident,"NaN",o[2],o[3],{value:"NaN"}])]):n.isTokenDimension(o)?new e.FunctionNode([n.TokenType.Function,"calc(",o[2],o[3],{value:"calc"}],[n.TokenType.CloseParen,")",o[2],o[3],void 0],[new e.TokenNode([n.TokenType.Ident,"NaN",o[2],o[3],{value:"NaN"}]),new e.WhitespaceNode([[n.TokenType.Whitespace," ",o[2],o[3],void 0]]),new e.TokenNode([n.TokenType.Delim,"*",o[2],o[3],{value:"*"}]),new e.WhitespaceNode([[n.TokenType.Whitespace," ",o[2],o[3],void 0]]),new e.TokenNode([n.TokenType.Dimension,"1"+o[4].unit,o[2],o[3],{value:1,type:n.NumberType.Integer,unit:o[4].unit}])]):n.isTokenPercentage(o)?new e.FunctionNode([n.TokenType.Function,"calc(",o[2],o[3],{value:"calc"}],[n.TokenType.CloseParen,")",o[2],o[3],void 0],[new e.TokenNode([n.TokenType.Ident,"NaN",o[2],o[3],{value:"NaN"}]),new e.WhitespaceNode([[n.TokenType.Whitespace," ",o[2],o[3],void 0]]),new e.TokenNode([n.TokenType.Delim,"*",o[2],o[3],{value:"*"}]),new e.WhitespaceNode([[n.TokenType.Whitespace," ",o[2],o[3],void 0]]),new e.TokenNode([n.TokenType.Percentage,"1%",o[2],o[3],{value:1}])]):-1:t}function patchInfinity(t){if(-1===t)return-1;if(e.isFunctionNode(t))return t;const o=t.value;if(!n.isTokenNumeric(o))return t;if(Number.isFinite(o[4].value)||Number.isNaN(o[4].value))return t;let r="";return Number.NEGATIVE_INFINITY===o[4].value&&(r="-"),n.isTokenNumber(o)?new e.FunctionNode([n.TokenType.Function,"calc(",o[2],o[3],{value:"calc"}],[n.TokenType.CloseParen,")",o[2],o[3],void 0],[new e.TokenNode([n.TokenType.Ident,r+"infinity",o[2],o[3],{value:r+"infinity"}])]):n.isTokenDimension(o)?new e.FunctionNode([n.TokenType.Function,"calc(",o[2],o[3],{value:"calc"}],[n.TokenType.CloseParen,")",o[2],o[3],void 0],[new e.TokenNode([n.TokenType.Ident,r+"infinity",o[2],o[3],{value:r+"infinity"}]),new e.WhitespaceNode([[n.TokenType.Whitespace," ",o[2],o[3],void 0]]),new e.TokenNode([n.TokenType.Delim,"*",o[2],o[3],{value:"*"}]),new e.WhitespaceNode([[n.TokenType.Whitespace," ",o[2],o[3],void 0]]),new e.TokenNode([n.TokenType.Dimension,"1"+o[4].unit,o[2],o[3],{value:1,type:n.NumberType.Integer,unit:o[4].unit}])]):new e.FunctionNode([n.TokenType.Function,"calc(",o[2],o[3],{value:"calc"}],[n.TokenType.CloseParen,")",o[2],o[3],void 0],[new e.TokenNode([n.TokenType.Ident,r+"infinity",o[2],o[3],{value:r+"infinity"}]),new e.WhitespaceNode([[n.TokenType.Whitespace," ",o[2],o[3],void 0]]),new e.TokenNode([n.TokenType.Delim,"*",o[2],o[3],{value:"*"}]),new e.WhitespaceNode([[n.TokenType.Whitespace," ",o[2],o[3],void 0]]),new e.TokenNode([n.TokenType.Percentage,"1%",o[2],o[3],{value:1}])])}function patchMinusZero(t){if(-1===t)return-1;if(e.isFunctionNode(t))return t;const o=t.value;return n.isTokenNumeric(o)&&Object.is(-0,o[4].value)?("-0"===o[1]||(n.isTokenPercentage(o)?o[1]="-0%":n.isTokenDimension(o)?o[1]="-0"+o[4].unit:o[1]="-0"),t):t}function patchPrecision(t,o=13){if(-1===t)return-1;if(o<=0)return t;if(e.isFunctionNode(t))return t;const r=t.value;if(!n.isTokenNumeric(r))return t;if(Number.isInteger(r[4].value))return t;const i=Number(r[4].value.toFixed(o)).toString();return n.isTokenNumber(r)?r[1]=i:n.isTokenPercentage(r)?r[1]=i+"%":n.isTokenDimension(r)&&(r[1]=i+r[4].unit),t}function patchCanonicalUnit(t){return-1===t?-1:e.isFunctionNode(t)?t:n.isTokenDimension(t.value)?(t.value=toCanonicalUnit(t.value),t):t}function patchCalcResult(e,n){let t=e;return n?.toCanonicalUnits&&(t=patchCanonicalUnit(t)),t=patchPrecision(t,n?.precision),t=patchMinusZero(t),n?.censorIntoStandardRepresentableValues||(t=patchNaN(t),t=patchInfinity(t)),t}function tokenizeGlobals(e){const t=new Map;if(!e)return t;for(const[o,r]of e)if(n.isToken(r))t.set(o,r);else if("string"!=typeof r);else{const e=n.tokenizer({css:r}),i=e.nextToken();if(e.nextToken(),!e.endOfFile())continue;if(!n.isTokenNumeric(i))continue;t.set(o,i)}return t}function calcFromComponentValues(n,t){const o=tokenizeGlobals(t?.globals);return e.replaceComponentValues(n,(n=>{if(!e.isFunctionNode(n))return;const r=b.get(n.getName().toLowerCase());if(!r)return;const i=patchCalcResult(solve(r(n,o,t??{})),t);return-1!==i?i:void 0}))}const h=new Set(b.keys());exports.calc=function calc(t,o){return calcFromComponentValues(e.parseCommaSeparatedListOfComponentValues(n.tokenize({css:t}),{}),o).map((e=>e.map((e=>n.stringify(...e.tokens()))).join(""))).join(",")},exports.calcFromComponentValues=calcFromComponentValues,exports.mathFunctionNames=h;
+var e=__nccwpck_require__(85181),n=__nccwpck_require__(68929);const t=/[A-Z]/g;function toLowerCaseAZ(e){return e.replace(t,(e=>String.fromCharCode(e.charCodeAt(0)+32)))}const o={cm:"px",in:"px",mm:"px",pc:"px",pt:"px",px:"px",q:"px",deg:"deg",grad:"deg",rad:"deg",turn:"deg",ms:"s",s:"s",hz:"hz",khz:"hz"},r=new Map([["cm",e=>e],["mm",e=>10*e],["q",e=>40*e],["in",e=>e/2.54],["pc",e=>e/2.54*6],["pt",e=>e/2.54*72],["px",e=>e/2.54*96]]),i=new Map([["deg",e=>e],["grad",e=>e/.9],["rad",e=>e/180*Math.PI],["turn",e=>e/360]]),u=new Map([["deg",e=>.9*e],["grad",e=>e],["rad",e=>.9*e/180*Math.PI],["turn",e=>.9*e/360]]),a=new Map([["hz",e=>e],["khz",e=>e/1e3]]),s=new Map([["cm",e=>2.54*e],["mm",e=>25.4*e],["q",e=>25.4*e*4],["in",e=>e],["pc",e=>6*e],["pt",e=>72*e],["px",e=>96*e]]),l=new Map([["hz",e=>1e3*e],["khz",e=>e]]),c=new Map([["cm",e=>e/10],["mm",e=>e],["q",e=>4*e],["in",e=>e/25.4],["pc",e=>e/25.4*6],["pt",e=>e/25.4*72],["px",e=>e/25.4*96]]),m=new Map([["ms",e=>e],["s",e=>e/1e3]]),v=new Map([["cm",e=>e/6*2.54],["mm",e=>e/6*25.4],["q",e=>e/6*25.4*4],["in",e=>e/6],["pc",e=>e],["pt",e=>e/6*72],["px",e=>e/6*96]]),T=new Map([["cm",e=>e/72*2.54],["mm",e=>e/72*25.4],["q",e=>e/72*25.4*4],["in",e=>e/72],["pc",e=>e/72*6],["pt",e=>e],["px",e=>e/72*96]]),p=new Map([["cm",e=>e/96*2.54],["mm",e=>e/96*25.4],["q",e=>e/96*25.4*4],["in",e=>e/96],["pc",e=>e/96*6],["pt",e=>e/96*72],["px",e=>e]]),N=new Map([["cm",e=>e/4/10],["mm",e=>e/4],["q",e=>e],["in",e=>e/4/25.4],["pc",e=>e/4/25.4*6],["pt",e=>e/4/25.4*72],["px",e=>e/4/25.4*96]]),f=new Map([["deg",e=>180*e/Math.PI],["grad",e=>180*e/Math.PI/.9],["rad",e=>e],["turn",e=>180*e/Math.PI/360]]),d=new Map([["ms",e=>1e3*e],["s",e=>e]]),k=new Map([["deg",e=>360*e],["grad",e=>360*e/.9],["rad",e=>360*e/180*Math.PI],["turn",e=>e]]),C=new Map([["cm",r],["mm",c],["q",N],["in",s],["pc",v],["pt",T],["px",p],["ms",m],["s",d],["deg",i],["grad",u],["rad",f],["turn",k],["hz",a],["khz",l]]);function convertUnit(e,t){if(!n.isTokenDimension(e))return t;if(!n.isTokenDimension(t))return t;const o=toLowerCaseAZ(e[4].unit),r=toLowerCaseAZ(t[4].unit);if(o===r)return t;const i=C.get(r);if(!i)return t;const u=i.get(o);if(!u)return t;const a=u(t[4].value),s=[n.TokenType.Dimension,"",t[2],t[3],{...t[4],signCharacter:a<0?"-":void 0,type:Number.isInteger(a)?n.NumberType.Integer:n.NumberType.Number,value:a}];return n.mutateUnit(s,e[4].unit),s}function toCanonicalUnit(e){if(!n.isTokenDimension(e))return e;const t=toLowerCaseAZ(e[4].unit),r=o[t];if(t===r)return e;const i=C.get(t);if(!i)return e;const u=i.get(r);if(!u)return e;const a=u(e[4].value),s=[n.TokenType.Dimension,"",e[2],e[3],{...e[4],signCharacter:a<0?"-":void 0,type:Number.isInteger(a)?n.NumberType.Integer:n.NumberType.Number,value:a}];return n.mutateUnit(s,r),s}function addition(t){if(2!==t.length)return-1;const o=t[0].value;let r=t[1].value;if(n.isTokenNumber(o)&&n.isTokenNumber(r)){const t=o[4].value+r[4].value;return new e.TokenNode([n.TokenType.Number,t.toString(),o[2],r[3],{value:t,type:o[4].type===n.NumberType.Integer&&r[4].type===n.NumberType.Integer?n.NumberType.Integer:n.NumberType.Number}])}if(n.isTokenPercentage(o)&&n.isTokenPercentage(r)){const t=o[4].value+r[4].value;return new e.TokenNode([n.TokenType.Percentage,t.toString()+"%",o[2],r[3],{value:t}])}if(n.isTokenDimension(o)&&n.isTokenDimension(r)&&(r=convertUnit(o,r),toLowerCaseAZ(o[4].unit)===toLowerCaseAZ(r[4].unit))){const t=o[4].value+r[4].value;return new e.TokenNode([n.TokenType.Dimension,t.toString()+o[4].unit,o[2],r[3],{value:t,type:o[4].type===n.NumberType.Integer&&r[4].type===n.NumberType.Integer?n.NumberType.Integer:n.NumberType.Number,unit:o[4].unit}])}return-1}function division(t){if(2!==t.length)return-1;const o=t[0].value,r=t[1].value;if(n.isTokenNumber(o)&&n.isTokenNumber(r)){const t=o[4].value/r[4].value;return new e.TokenNode([n.TokenType.Number,t.toString(),o[2],r[3],{value:t,type:Number.isInteger(t)?n.NumberType.Integer:n.NumberType.Number}])}if(n.isTokenPercentage(o)&&n.isTokenNumber(r)){const t=o[4].value/r[4].value;return new e.TokenNode([n.TokenType.Percentage,t.toString()+"%",o[2],r[3],{value:t}])}if(n.isTokenDimension(o)&&n.isTokenNumber(r)){const t=o[4].value/r[4].value;return new e.TokenNode([n.TokenType.Dimension,t.toString()+o[4].unit,o[2],r[3],{value:t,type:Number.isInteger(t)?n.NumberType.Integer:n.NumberType.Number,unit:o[4].unit}])}return-1}function isCalculation(e){return!!e&&"object"==typeof e&&"inputs"in e&&Array.isArray(e.inputs)&&"operation"in e}function solve(n){if(-1===n)return-1;const t=[];for(let o=0;o<n.inputs.length;o++){const r=n.inputs[o];if(e.isTokenNode(r)){t.push(r);continue}const i=solve(r);if(-1===i)return-1;t.push(i)}return n.operation(t)}function multiplication(t){if(2!==t.length)return-1;const o=t[0].value,r=t[1].value;if(n.isTokenNumber(o)&&n.isTokenNumber(r)){const t=o[4].value*r[4].value;return new e.TokenNode([n.TokenType.Number,t.toString(),o[2],r[3],{value:t,type:o[4].type===n.NumberType.Integer&&r[4].type===n.NumberType.Integer?n.NumberType.Integer:n.NumberType.Number}])}if(n.isTokenPercentage(o)&&n.isTokenNumber(r)){const t=o[4].value*r[4].value;return new e.TokenNode([n.TokenType.Percentage,t.toString()+"%",o[2],r[3],{value:t}])}if(n.isTokenNumber(o)&&n.isTokenPercentage(r)){const t=o[4].value*r[4].value;return new e.TokenNode([n.TokenType.Percentage,t.toString()+"%",o[2],r[3],{value:t}])}if(n.isTokenDimension(o)&&n.isTokenNumber(r)){const t=o[4].value*r[4].value;return new e.TokenNode([n.TokenType.Dimension,t.toString()+o[4].unit,o[2],r[3],{value:t,type:o[4].type===n.NumberType.Integer&&r[4].type===n.NumberType.Integer?n.NumberType.Integer:n.NumberType.Number,unit:o[4].unit}])}if(n.isTokenNumber(o)&&n.isTokenDimension(r)){const t=o[4].value*r[4].value;return new e.TokenNode([n.TokenType.Dimension,t.toString()+r[4].unit,o[2],r[3],{value:t,type:o[4].type===n.NumberType.Integer&&r[4].type===n.NumberType.Integer?n.NumberType.Integer:n.NumberType.Number,unit:r[4].unit}])}return-1}function resolveGlobalsAndConstants(t,o){for(let r=0;r<t.length;r++){const i=t[r];if(!e.isTokenNode(i))continue;const u=i.value;if(!n.isTokenIdent(u))continue;const a=toLowerCaseAZ(u[4].value);switch(a){case"e":t.splice(r,1,new e.TokenNode([n.TokenType.Number,Math.E.toString(),u[2],u[3],{value:Math.E,type:n.NumberType.Number}]));break;case"pi":t.splice(r,1,new e.TokenNode([n.TokenType.Number,Math.PI.toString(),u[2],u[3],{value:Math.PI,type:n.NumberType.Number}]));break;case"infinity":t.splice(r,1,new e.TokenNode([n.TokenType.Number,"infinity",u[2],u[3],{value:1/0,type:n.NumberType.Number}]));break;case"-infinity":t.splice(r,1,new e.TokenNode([n.TokenType.Number,"-infinity",u[2],u[3],{value:-1/0,type:n.NumberType.Number}]));break;case"nan":t.splice(r,1,new e.TokenNode([n.TokenType.Number,"NaN",u[2],u[3],{value:Number.NaN,type:n.NumberType.Number}]));break;default:if(o.has(a)){const n=o.get(a);t.splice(r,1,new e.TokenNode(n))}}}return t}function unary(e){if(1!==e.length)return-1;const t=e[0].value;return n.isTokenNumeric(t)?e[0]:-1}function resultToCalculation(e,t,o){return n.isTokenDimension(t)?dimensionToCalculation(e,t[4].unit,o):n.isTokenPercentage(t)?percentageToCalculation(e,o):n.isTokenNumber(t)?numberToCalculation(e,o):-1}function dimensionToCalculation(t,o,r){const i=t.tokens();return{inputs:[new e.TokenNode([n.TokenType.Dimension,r.toString()+o,i[0][2],i[i.length-1][3],{value:r,type:Number.isInteger(r)?n.NumberType.Integer:n.NumberType.Number,unit:o}])],operation:unary}}function percentageToCalculation(t,o){const r=t.tokens();return{inputs:[new e.TokenNode([n.TokenType.Percentage,o.toString()+"%",r[0][2],r[r.length-1][3],{value:o}])],operation:unary}}function numberToCalculation(t,o){const r=t.tokens();return{inputs:[new e.TokenNode([n.TokenType.Number,o.toString(),r[0][2],r[r.length-1][3],{value:o,type:Number.isInteger(o)?n.NumberType.Integer:n.NumberType.Number}])],operation:unary}}function solveACos(e,t){const o=t.value;if(!n.isTokenNumber(o))return-1;return dimensionToCalculation(e,"rad",Math.acos(o[4].value))}function solveASin(e,t){const o=t.value;if(!n.isTokenNumber(o))return-1;return dimensionToCalculation(e,"rad",Math.asin(o[4].value))}function solveATan(e,t){const o=t.value;if(!n.isTokenNumber(o))return-1;return dimensionToCalculation(e,"rad",Math.atan(o[4].value))}function isDimensionOrNumber(e){return n.isTokenDimension(e)||n.isTokenNumber(e)}function arrayOfSameNumeric(e){if(0===e.length)return!0;const t=e[0];if(!n.isTokenNumeric(t))return!1;if(1===e.length)return!0;if(n.isTokenDimension(t)){const n=toLowerCaseAZ(t[4].unit);for(let o=1;o<e.length;o++){const r=e[o];if(t[0]!==r[0])return!1;if(n!==toLowerCaseAZ(r[4].unit))return!1}return!0}for(let n=1;n<e.length;n++){const o=e[n];if(t[0]!==o[0])return!1}return!0}function twoOfSameNumeric(e,t){return!!n.isTokenNumeric(e)&&(n.isTokenDimension(e)?e[0]===t[0]&&toLowerCaseAZ(e[4].unit)===toLowerCaseAZ(t[4].unit):e[0]===t[0])}function solveATan2(e,n,t){const o=n.value;if(!isDimensionOrNumber(o))return-1;const r=convertUnit(o,t.value);if(!twoOfSameNumeric(o,r))return-1;return dimensionToCalculation(e,"rad",Math.atan2(o[4].value,r[4].value))}function solveAbs(e,t,o){const r=t.value;if(!n.isTokenNumeric(r))return-1;if(!o.rawPercentages&&n.isTokenPercentage(r))return-1;return resultToCalculation(e,r,Math.abs(r[4].value))}function solveClamp(t,o,r,i,u){if(!e.isTokenNode(o)||!e.isTokenNode(r)||!e.isTokenNode(i))return-1;const a=o.value;if(!n.isTokenNumeric(a))return-1;if(!u.rawPercentages&&n.isTokenPercentage(a))return-1;const s=convertUnit(a,r.value);if(!twoOfSameNumeric(a,s))return-1;const l=convertUnit(a,i.value);if(!twoOfSameNumeric(a,l))return-1;return resultToCalculation(t,a,Math.max(a[4].value,Math.min(s[4].value,l[4].value)))}function solveCos(e,t){const o=t.value;if(!isDimensionOrNumber(o))return-1;let r=o[4].value;if(n.isTokenDimension(o))switch(o[4].unit.toLowerCase()){case"rad":break;case"deg":r=i.get("rad")(o[4].value);break;case"grad":r=u.get("rad")(o[4].value);break;case"turn":r=k.get("rad")(o[4].value);break;default:return-1}return r=Math.cos(r),numberToCalculation(e,r)}function solveExp(e,t){const o=t.value;if(!n.isTokenNumber(o))return-1;return numberToCalculation(e,Math.exp(o[4].value))}function solveHypot(t,o,r){if(!o.every(e.isTokenNode))return-1;const i=o[0].value;if(!n.isTokenNumeric(i))return-1;if(!r.rawPercentages&&n.isTokenPercentage(i))return-1;const u=o.map((e=>convertUnit(i,e.value)));if(!arrayOfSameNumeric(u))return-1;const a=u.map((e=>e[4].value)),s=Math.hypot(...a);return resultToCalculation(t,i,s)}function solveMax(t,o,r){if(!o.every(e.isTokenNode))return-1;const i=o[0].value;if(!n.isTokenNumeric(i))return-1;if(!r.rawPercentages&&n.isTokenPercentage(i))return-1;const u=o.map((e=>convertUnit(i,e.value)));if(!arrayOfSameNumeric(u))return-1;const a=u.map((e=>e[4].value)),s=Math.max(...a);return resultToCalculation(t,i,s)}function solveMin(t,o,r){if(!o.every(e.isTokenNode))return-1;const i=o[0].value;if(!n.isTokenNumeric(i))return-1;if(!r.rawPercentages&&n.isTokenPercentage(i))return-1;const u=o.map((e=>convertUnit(i,e.value)));if(!arrayOfSameNumeric(u))return-1;const a=u.map((e=>e[4].value)),s=Math.min(...a);return resultToCalculation(t,i,s)}function solveMod(e,t,o){const r=t.value;if(!n.isTokenNumeric(r))return-1;const i=convertUnit(r,o.value);if(!twoOfSameNumeric(r,i))return-1;let u;return u=0===i[4].value?Number.NaN:Number.isFinite(r[4].value)&&(Number.isFinite(i[4].value)||(i[4].value!==Number.POSITIVE_INFINITY||r[4].value!==Number.NEGATIVE_INFINITY&&!Object.is(0*r[4].value,-0))&&(i[4].value!==Number.NEGATIVE_INFINITY||r[4].value!==Number.POSITIVE_INFINITY&&!Object.is(0*r[4].value,0)))?Number.isFinite(i[4].value)?(r[4].value%i[4].value+i[4].value)%i[4].value:r[4].value:Number.NaN,resultToCalculation(e,r,u)}function solvePow(e,t,o){const r=t.value,i=o.value;if(!n.isTokenNumber(r))return-1;if(!twoOfSameNumeric(r,i))return-1;return numberToCalculation(e,Math.pow(r[4].value,i[4].value))}function solveRem(e,t,o){const r=t.value;if(!n.isTokenNumeric(r))return-1;const i=convertUnit(r,o.value);if(!twoOfSameNumeric(r,i))return-1;let u;return u=0===i[4].value?Number.NaN:Number.isFinite(r[4].value)?Number.isFinite(i[4].value)?r[4].value%i[4].value:r[4].value:Number.NaN,resultToCalculation(e,r,u)}function solveRound(e,t,o,r,i){const u=o.value;if(!n.isTokenNumeric(u))return-1;if(!i.rawPercentages&&n.isTokenPercentage(u))return-1;const a=convertUnit(u,r.value);if(!twoOfSameNumeric(u,a))return-1;let s;if(0===a[4].value)s=Number.NaN;else if(Number.isFinite(u[4].value)||Number.isFinite(a[4].value))if(!Number.isFinite(u[4].value)&&Number.isFinite(a[4].value))s=u[4].value;else if(Number.isFinite(u[4].value)&&!Number.isFinite(a[4].value))switch(t){case"down":s=u[4].value<0?-1/0:Object.is(-0,0*u[4].value)?-0:0;break;case"up":s=u[4].value>0?1/0:Object.is(0,0*u[4].value)?0:-0;break;default:s=Object.is(0,0*u[4].value)?0:-0}else if(Number.isFinite(a[4].value))switch(t){case"down":s=Math.floor(u[4].value/a[4].value)*a[4].value;break;case"up":s=Math.ceil(u[4].value/a[4].value)*a[4].value;break;case"to-zero":s=Math.trunc(u[4].value/a[4].value)*a[4].value;break;default:{let e=Math.floor(u[4].value/a[4].value)*a[4].value,n=Math.ceil(u[4].value/a[4].value)*a[4].value;if(e>n){const t=e;e=n,n=t}const t=Math.abs(u[4].value-e),o=Math.abs(u[4].value-n);s=t===o?n:t<o?e:n;break}}else s=u[4].value;else s=Number.NaN;return resultToCalculation(e,u,s)}function solveSign(e,t,o){const r=t.value;if(!n.isTokenNumeric(r))return-1;if(!o.rawPercentages&&n.isTokenPercentage(r))return-1;return numberToCalculation(e,Math.sign(r[4].value))}function solveSin(e,t){const o=t.value;if(!isDimensionOrNumber(o))return-1;let r=o[4].value;if(n.isTokenDimension(o))switch(toLowerCaseAZ(o[4].unit)){case"rad":break;case"deg":r=i.get("rad")(o[4].value);break;case"grad":r=u.get("rad")(o[4].value);break;case"turn":r=k.get("rad")(o[4].value);break;default:return-1}return r=Math.sin(r),numberToCalculation(e,r)}function solveSqrt(e,t){const o=t.value;if(!n.isTokenNumber(o))return-1;return numberToCalculation(e,Math.sqrt(o[4].value))}function solveTan(e,t){const o=t.value;if(!isDimensionOrNumber(o))return-1;const r=o[4].value;let a=0,s=o[4].value;if(n.isTokenDimension(o))switch(toLowerCaseAZ(o[4].unit)){case"rad":a=f.get("deg")(r);break;case"deg":a=r,s=i.get("rad")(r);break;case"grad":a=u.get("deg")(r),s=u.get("rad")(r);break;case"turn":a=k.get("deg")(r),s=k.get("rad")(r);break;default:return-1}const l=a/90;return s=a%90==0&&l%2!=0?l>0?1/0:-1/0:Math.tan(s),numberToCalculation(e,s)}function subtraction(t){if(2!==t.length)return-1;const o=t[0].value;let r=t[1].value;if(n.isTokenNumber(o)&&n.isTokenNumber(r)){const t=o[4].value-r[4].value;return new e.TokenNode([n.TokenType.Number,t.toString(),o[2],r[3],{value:t,type:o[4].type===n.NumberType.Integer&&r[4].type===n.NumberType.Integer?n.NumberType.Integer:n.NumberType.Number}])}if(n.isTokenPercentage(o)&&n.isTokenPercentage(r)){const t=o[4].value-r[4].value;return new e.TokenNode([n.TokenType.Percentage,t.toString()+"%",o[2],r[3],{value:t}])}if(n.isTokenDimension(o)&&n.isTokenDimension(r)&&(r=convertUnit(o,r),toLowerCaseAZ(o[4].unit)===toLowerCaseAZ(r[4].unit))){const t=o[4].value-r[4].value;return new e.TokenNode([n.TokenType.Dimension,t.toString()+o[4].unit,o[2],r[3],{value:t,type:o[4].type===n.NumberType.Integer&&r[4].type===n.NumberType.Integer?n.NumberType.Integer:n.NumberType.Number,unit:o[4].unit}])}return-1}function solveLog(t,o){if(1===o.length){const r=o[0];if(!r||!e.isTokenNode(r))return-1;const i=r.value;if(!n.isTokenNumber(i))return-1;return numberToCalculation(t,Math.log(i[4].value))}if(2===o.length){const r=o[0];if(!r||!e.isTokenNode(r))return-1;const i=r.value;if(!n.isTokenNumber(i))return-1;const u=o[1];if(!u||!e.isTokenNode(u))return-1;const a=u.value;if(!n.isTokenNumber(a))return-1;return numberToCalculation(t,Math.log(i[4].value)/Math.log(a[4].value))}return-1}const g=/^none$/i;function isNone(t){if(Array.isArray(t)){const n=t.filter((n=>!(e.isWhitespaceNode(n)&&e.isCommentNode(n))));return 1===n.length&&isNone(n[0])}if(!e.isTokenNode(t))return!1;const o=t.value;return!!n.isTokenIdent(o)&&g.test(o[4].value)}const D=String.fromCodePoint(0);function solveRandom(e,t,o,r,i,u){if(-1===t.fixed&&!u.randomCaching)return-1;u.randomCaching||(u.randomCaching={propertyName:"",propertyN:0,elementID:"",documentID:""}),u.randomCaching&&!u.randomCaching.propertyN&&(u.randomCaching.propertyN=0);const a=o.value;if(!n.isTokenNumeric(a))return-1;const s=convertUnit(a,r.value);if(!twoOfSameNumeric(a,s))return-1;let l=null;if(i&&(l=convertUnit(a,i.value),!twoOfSameNumeric(a,l)))return-1;if(!Number.isFinite(a[4].value))return resultToCalculation(e,a,Number.NaN);if(!Number.isFinite(s[4].value))return resultToCalculation(e,a,Number.NaN);if(!Number.isFinite(s[4].value-a[4].value))return resultToCalculation(e,a,Number.NaN);if(l&&!Number.isFinite(l[4].value))return resultToCalculation(e,a,a[4].value);const c=-1===t.fixed?sfc32(crc32([t.dashedIdent?t.dashedIdent:`${u.randomCaching?.propertyName} ${u.randomCaching.propertyN++}`,t.elementShared?"":u.randomCaching.elementID,u.randomCaching.documentID].join(D))):()=>t.fixed;let m=a[4].value,v=s[4].value;if(m>v&&([m,v]=[v,m]),l&&(l[4].value<=0||Math.abs(m-v)/l[4].value>1e10)&&(l=null),l){const n=Math.max(l[4].value/1e3,1e-9),t=[m];let o=0;for(;;){o+=l[4].value;const e=m+o;if(!(e+n<v)){t.push(v);break}if(t.push(e),e+l[4].value-n>v)break}const r=c();return resultToCalculation(e,a,Number(t[Math.floor(t.length*r)].toFixed(5)))}const T=c();return resultToCalculation(e,a,Number((T*(v-m)+m).toFixed(5)))}function sfc32(e=.34944106645296036,n=.19228640875738723,t=.8784393832007205,o=.04850964319275053){return()=>{const r=((e|=0)+(n|=0)|0)+(o|=0)|0;return o=o+1|0,e=n^n>>>9,n=(t|=0)+(t<<3)|0,t=(t=t<<21|t>>>11)+r|0,(r>>>0)/4294967296}}function crc32(e){let n=0,t=0,o=0;n^=-1;for(let r=0,i=e.length;r<i;r++)o=255&(n^e.charCodeAt(r)),t=Number("0x"+"00000000 77073096 EE0E612C 990951BA 076DC419 706AF48F E963A535 9E6495A3 0EDB8832 79DCB8A4 E0D5E91E 97D2D988 09B64C2B 7EB17CBD E7B82D07 90BF1D91 1DB71064 6AB020F2 F3B97148 84BE41DE 1ADAD47D 6DDDE4EB F4D4B551 83D385C7 136C9856 646BA8C0 FD62F97A 8A65C9EC 14015C4F 63066CD9 FA0F3D63 8D080DF5 3B6E20C8 4C69105E D56041E4 A2677172 3C03E4D1 4B04D447 D20D85FD A50AB56B 35B5A8FA 42B2986C DBBBC9D6 ACBCF940 32D86CE3 45DF5C75 DCD60DCF ABD13D59 26D930AC 51DE003A C8D75180 BFD06116 21B4F4B5 56B3C423 CFBA9599 B8BDA50F 2802B89E 5F058808 C60CD9B2 B10BE924 2F6F7C87 58684C11 C1611DAB B6662D3D 76DC4190 01DB7106 98D220BC EFD5102A 71B18589 06B6B51F 9FBFE4A5 E8B8D433 7807C9A2 0F00F934 9609A88E E10E9818 7F6A0DBB 086D3D2D 91646C97 E6635C01 6B6B51F4 1C6C6162 856530D8 F262004E 6C0695ED 1B01A57B 8208F4C1 F50FC457 65B0D9C6 12B7E950 8BBEB8EA FCB9887C 62DD1DDF 15DA2D49 8CD37CF3 FBD44C65 4DB26158 3AB551CE A3BC0074 D4BB30E2 4ADFA541 3DD895D7 A4D1C46D D3D6F4FB 4369E96A 346ED9FC AD678846 DA60B8D0 44042D73 33031DE5 AA0A4C5F DD0D7CC9 5005713C 270241AA BE0B1010 C90C2086 5768B525 206F85B3 B966D409 CE61E49F 5EDEF90E 29D9C998 B0D09822 C7D7A8B4 59B33D17 2EB40D81 B7BD5C3B C0BA6CAD EDB88320 9ABFB3B6 03B6E20C 74B1D29A EAD54739 9DD277AF 04DB2615 73DC1683 E3630B12 94643B84 0D6D6A3E 7A6A5AA8 E40ECF0B 9309FF9D 0A00AE27 7D079EB1 F00F9344 8708A3D2 1E01F268 6906C2FE F762575D 806567CB 196C3671 6E6B06E7 FED41B76 89D32BE0 10DA7A5A 67DD4ACC F9B9DF6F 8EBEEFF9 17B7BE43 60B08ED5 D6D6A3E8 A1D1937E 38D8C2C4 4FDFF252 D1BB67F1 A6BC5767 3FB506DD 48B2364B D80D2BDA AF0A1B4C 36034AF6 41047A60 DF60EFC3 A867DF55 316E8EEF 4669BE79 CB61B38C BC66831A 256FD2A0 5268E236 CC0C7795 BB0B4703 220216B9 5505262F C5BA3BBE B2BD0B28 2BB45A92 5CB36A04 C2D7FFA7 B5D0CF31 2CD99E8B 5BDEAE1D 9B64C2B0 EC63F226 756AA39C 026D930A 9C0906A9 EB0E363F 72076785 05005713 95BF4A82 E2B87A14 7BB12BAE 0CB61B38 92D28E9B E5D5BE0D 7CDCEFB7 0BDBDF21 86D3D2D4 F1D4E242 68DDB3F8 1FDA836E 81BE16CD F6B9265B 6FB077E1 18B74777 88085AE6 FF0F6A70 66063BCA 11010B5C 8F659EFF F862AE69 616BFFD3 166CCF45 A00AE278 D70DD2EE 4E048354 3903B3C2 A7672661 D06016F7 4969474D 3E6E77DB AED16A4A D9D65ADC 40DF0B66 37D83BF0 A9BCAE53 DEBB9EC5 47B2CF7F 30B5FFE9 BDBDF21C CABAC28A 53B39330 24B4A3A6 BAD03605 CDD70693 54DE5729 23D967BF B3667A2E C4614AB8 5D681B02 2A6F2B94 B40BBE37 C30C8EA1 5A05DF1B 2D02EF8D".substring(9*o,9*o+8)),n=n>>>8^t;return(-1^n)>>>0}const b=new Map([["abs",function abs(e,n,t){return singleNodeSolver(e,n,t,solveAbs)}],["acos",function acos(e,n,t){return singleNodeSolver(e,n,t,solveACos)}],["asin",function asin(e,n,t){return singleNodeSolver(e,n,t,solveASin)}],["atan",function atan(e,n,t){return singleNodeSolver(e,n,t,solveATan)}],["atan2",function atan2(e,n,t){return twoCommaSeparatedNodesSolver(e,n,t,solveATan2)}],["calc",calc$1],["clamp",function clamp(t,o,r){const i=resolveGlobalsAndConstants([...t.value.filter((n=>!e.isWhiteSpaceOrCommentNode(n)))],o),u=[],a=[],s=[];{let t=u;for(let o=0;o<i.length;o++){const r=i[o];if(e.isTokenNode(r)&&n.isTokenComma(r.value)){if(t===s)return-1;if(t===a){t=s;continue}if(t===u){t=a;continue}return-1}t.push(r)}}const l=isNone(u),c=isNone(s);if(l&&c)return calc$1(calcWrapper(a),o,r);const m=solve(calc$1(calcWrapper(a),o,r));if(-1===m)return-1;if(l){const t=solve(calc$1(calcWrapper(s),o,r));return-1===t?-1:solveMin((v=m,T=t,new e.FunctionNode([n.TokenType.Function,"min(",-1,-1,{value:"min"}],[n.TokenType.CloseParen,")",-1,-1,void 0],[v,new e.TokenNode([n.TokenType.Comma,",",-1,-1,void 0]),T])),[m,t],r)}if(c){const e=solve(calc$1(calcWrapper(u),o,r));return-1===e?-1:solveMax(maxWrapper(e,m),[e,m],r)}var v,T;const p=solve(calc$1(calcWrapper(u),o,r));if(-1===p)return-1;const N=solve(calc$1(calcWrapper(s),o,r));if(-1===N)return-1;return solveClamp(t,p,m,N,r)}],["cos",function cos(e,n,t){return singleNodeSolver(e,n,t,solveCos)}],["exp",function exp(e,n,t){return singleNodeSolver(e,n,t,solveExp)}],["hypot",function hypot(e,n,t){return variadicNodesSolver(e,e.value,n,t,solveHypot)}],["log",function log(e,n,t){return variadicNodesSolver(e,e.value,n,t,solveLog)}],["max",function max(e,n,t){return variadicNodesSolver(e,e.value,n,t,solveMax)}],["min",function min(e,n,t){return variadicNodesSolver(e,e.value,n,t,solveMin)}],["mod",function mod(e,n,t){return twoCommaSeparatedNodesSolver(e,n,t,solveMod)}],["pow",function pow(e,n,t){return twoCommaSeparatedNodesSolver(e,n,t,solvePow)}],["random",function random(n,t,o){const r=parseRandomValueSharing(n.value.filter((n=>!e.isWhiteSpaceOrCommentNode(n))),t,o);if(-1===r)return-1;const[i,u]=r,a=variadicArguments(u,t,o);if(-1===a)return-1;const[s,l,c]=a;if(!s||!l)return-1;return solveRandom(n,i,s,l,c,o)}],["rem",function rem(e,n,t){return twoCommaSeparatedNodesSolver(e,n,t,solveRem)}],["round",function round(t,o,r){const i=resolveGlobalsAndConstants([...t.value.filter((n=>!e.isWhiteSpaceOrCommentNode(n)))],o);let u="",a=!1;const s=[],l=[];{let t=s;for(let o=0;o<i.length;o++){const r=i[o];if(!u&&0===s.length&&0===l.length&&e.isTokenNode(r)&&n.isTokenIdent(r.value)){const e=r.value[4].value.toLowerCase();if(y.has(e)){u=e;continue}}if(e.isTokenNode(r)&&n.isTokenComma(r.value)){if(t===l)return-1;if(t===s&&u&&0===s.length)continue;if(t===s){a=!0,t=l;continue}return-1}t.push(r)}}const c=solve(calc$1(calcWrapper(s),o,r));if(-1===c)return-1;a||0!==l.length||l.push(new e.TokenNode([n.TokenType.Number,"1",-1,-1,{value:1,type:n.NumberType.Integer}]));const m=solve(calc$1(calcWrapper(l),o,r));if(-1===m)return-1;u||(u="nearest");return solveRound(t,u,c,m,r)}],["sign",function sign(e,n,t){return singleNodeSolver(e,n,t,solveSign)}],["sin",function sin(e,n,t){return singleNodeSolver(e,n,t,solveSin)}],["sqrt",function sqrt(e,n,t){return singleNodeSolver(e,n,t,solveSqrt)}],["tan",function tan(e,n,t){return singleNodeSolver(e,n,t,solveTan)}]]);function calc$1(t,o,r){const i=resolveGlobalsAndConstants([...t.value.filter((n=>!e.isWhiteSpaceOrCommentNode(n)))],o);if(1===i.length&&e.isTokenNode(i[0]))return{inputs:[i[0]],operation:unary};let u=0;for(;u<i.length;){const t=i[u];if(e.isSimpleBlockNode(t)&&n.isTokenOpenParen(t.startToken)){const e=calc$1(t,o,r);if(-1===e)return-1;i.splice(u,1,e)}else if(e.isFunctionNode(t)){const e=b.get(t.getName().toLowerCase());if(!e)return-1;const n=e(t,o,r);if(-1===n)return-1;i.splice(u,1,n)}else u++}if(u=0,1===i.length&&isCalculation(i[0]))return i[0];for(;u<i.length;){const t=i[u];if(!t||!e.isTokenNode(t)&&!isCalculation(t)){u++;continue}const o=i[u+1];if(!o||!e.isTokenNode(o)){u++;continue}const r=o.value;if(!n.isTokenDelim(r)||"*"!==r[4].value&&"/"!==r[4].value){u++;continue}const a=i[u+2];if(!a||!e.isTokenNode(a)&&!isCalculation(a))return-1;"*"!==r[4].value?"/"!==r[4].value?u++:i.splice(u,3,{inputs:[t,a],operation:division}):i.splice(u,3,{inputs:[t,a],operation:multiplication})}if(u=0,1===i.length&&isCalculation(i[0]))return i[0];for(;u<i.length;){const t=i[u];if(!t||!e.isTokenNode(t)&&!isCalculation(t)){u++;continue}const o=i[u+1];if(!o||!e.isTokenNode(o)){u++;continue}const r=o.value;if(!n.isTokenDelim(r)||"+"!==r[4].value&&"-"!==r[4].value){u++;continue}const a=i[u+2];if(!a||!e.isTokenNode(a)&&!isCalculation(a))return-1;"+"!==r[4].value?"-"!==r[4].value?u++:i.splice(u,3,{inputs:[t,a],operation:subtraction}):i.splice(u,3,{inputs:[t,a],operation:addition})}return 1===i.length&&isCalculation(i[0])?i[0]:-1}function singleNodeSolver(e,n,t,o){const r=singleArgument(e.value,n,t);return-1===r?-1:o(e,r,t)}function singleArgument(n,t,o){const r=solve(calc$1(calcWrapper(resolveGlobalsAndConstants([...n.filter((n=>!e.isWhiteSpaceOrCommentNode(n)))],t)),t,o));return-1===r?-1:r}function twoCommaSeparatedNodesSolver(e,n,t,o){const r=twoCommaSeparatedArguments(e.value,n,t);if(-1===r)return-1;const[i,u]=r;return o(e,i,u,t)}function twoCommaSeparatedArguments(t,o,r){const i=resolveGlobalsAndConstants([...t.filter((n=>!e.isWhiteSpaceOrCommentNode(n)))],o),u=[],a=[];{let t=u;for(let o=0;o<i.length;o++){const r=i[o];if(e.isTokenNode(r)&&n.isTokenComma(r.value)){if(t===a)return-1;if(t===u){t=a;continue}return-1}t.push(r)}}const s=solve(calc$1(calcWrapper(u),o,r));if(-1===s)return-1;const l=solve(calc$1(calcWrapper(a),o,r));return-1===l?-1:[s,l]}function variadicNodesSolver(e,n,t,o,r){const i=variadicArguments(e.value,t,o);return-1===i?-1:r(e,i,o)}function variadicArguments(t,o,r){const i=resolveGlobalsAndConstants([...t.filter((n=>!e.isWhiteSpaceOrCommentNode(n)))],o),u=[];{const t=[];let a=[];for(let o=0;o<i.length;o++){const r=i[o];e.isTokenNode(r)&&n.isTokenComma(r.value)?(t.push(a),a=[]):a.push(r)}t.push(a);for(let e=0;e<t.length;e++){if(0===t[e].length)return-1;const n=solve(calc$1(calcWrapper(t[e]),o,r));if(-1===n)return-1;u.push(n)}}return u}const y=new Set(["nearest","up","down","to-zero"]);function parseRandomValueSharing(t,o,r){const i={isAuto:!1,dashedIdent:"",fixed:-1,elementShared:!1},u=t[0];if(!e.isTokenNode(u)||!n.isTokenIdent(u.value))return[i,t];for(let u=0;u<t.length;u++){const a=t[u];if(!e.isTokenNode(a))return-1;if(n.isTokenComma(a.value))return[i,t.slice(u+1)];if(!n.isTokenIdent(a.value))return-1;const s=a.value[4].value.toLowerCase();if("element-shared"!==s)if("fixed"!==s)if("auto"!==s)if(s.startsWith("--")){if(-1!==i.fixed||i.isAuto)return-1;i.dashedIdent=s}else;else{if(-1!==i.fixed||i.dashedIdent)return-1;i.isAuto=!0}else{if(i.elementShared||i.dashedIdent||i.isAuto)return-1;u++;const e=t[u];if(!e)return-1;const a=solve(calc$1(calcWrapper([e]),o,r));if(-1===a)return-1;if(!n.isTokenNumber(a.value))return-1;if(a.value[4].value<0||a.value[4].value>1)return-1;i.fixed=Math.max(0,Math.min(a.value[4].value,1-1e-9))}else{if(-1!==i.fixed)return-1;i.elementShared=!0}}return-1}function calcWrapper(t){return new e.FunctionNode([n.TokenType.Function,"calc(",-1,-1,{value:"calc"}],[n.TokenType.CloseParen,")",-1,-1,void 0],t)}function maxWrapper(t,o){return new e.FunctionNode([n.TokenType.Function,"max(",-1,-1,{value:"max"}],[n.TokenType.CloseParen,")",-1,-1,void 0],[t,new e.TokenNode([n.TokenType.Comma,",",-1,-1,void 0]),o])}function patchNaN(t){if(-1===t)return-1;if(e.isFunctionNode(t))return t;const o=t.value;return n.isTokenNumeric(o)&&Number.isNaN(o[4].value)?n.isTokenNumber(o)?new e.FunctionNode([n.TokenType.Function,"calc(",o[2],o[3],{value:"calc"}],[n.TokenType.CloseParen,")",o[2],o[3],void 0],[new e.TokenNode([n.TokenType.Ident,"NaN",o[2],o[3],{value:"NaN"}])]):n.isTokenDimension(o)?new e.FunctionNode([n.TokenType.Function,"calc(",o[2],o[3],{value:"calc"}],[n.TokenType.CloseParen,")",o[2],o[3],void 0],[new e.TokenNode([n.TokenType.Ident,"NaN",o[2],o[3],{value:"NaN"}]),new e.WhitespaceNode([[n.TokenType.Whitespace," ",o[2],o[3],void 0]]),new e.TokenNode([n.TokenType.Delim,"*",o[2],o[3],{value:"*"}]),new e.WhitespaceNode([[n.TokenType.Whitespace," ",o[2],o[3],void 0]]),new e.TokenNode([n.TokenType.Dimension,"1"+o[4].unit,o[2],o[3],{value:1,type:n.NumberType.Integer,unit:o[4].unit}])]):n.isTokenPercentage(o)?new e.FunctionNode([n.TokenType.Function,"calc(",o[2],o[3],{value:"calc"}],[n.TokenType.CloseParen,")",o[2],o[3],void 0],[new e.TokenNode([n.TokenType.Ident,"NaN",o[2],o[3],{value:"NaN"}]),new e.WhitespaceNode([[n.TokenType.Whitespace," ",o[2],o[3],void 0]]),new e.TokenNode([n.TokenType.Delim,"*",o[2],o[3],{value:"*"}]),new e.WhitespaceNode([[n.TokenType.Whitespace," ",o[2],o[3],void 0]]),new e.TokenNode([n.TokenType.Percentage,"1%",o[2],o[3],{value:1}])]):-1:t}function patchInfinity(t){if(-1===t)return-1;if(e.isFunctionNode(t))return t;const o=t.value;if(!n.isTokenNumeric(o))return t;if(Number.isFinite(o[4].value)||Number.isNaN(o[4].value))return t;let r="";return Number.NEGATIVE_INFINITY===o[4].value&&(r="-"),n.isTokenNumber(o)?new e.FunctionNode([n.TokenType.Function,"calc(",o[2],o[3],{value:"calc"}],[n.TokenType.CloseParen,")",o[2],o[3],void 0],[new e.TokenNode([n.TokenType.Ident,r+"infinity",o[2],o[3],{value:r+"infinity"}])]):n.isTokenDimension(o)?new e.FunctionNode([n.TokenType.Function,"calc(",o[2],o[3],{value:"calc"}],[n.TokenType.CloseParen,")",o[2],o[3],void 0],[new e.TokenNode([n.TokenType.Ident,r+"infinity",o[2],o[3],{value:r+"infinity"}]),new e.WhitespaceNode([[n.TokenType.Whitespace," ",o[2],o[3],void 0]]),new e.TokenNode([n.TokenType.Delim,"*",o[2],o[3],{value:"*"}]),new e.WhitespaceNode([[n.TokenType.Whitespace," ",o[2],o[3],void 0]]),new e.TokenNode([n.TokenType.Dimension,"1"+o[4].unit,o[2],o[3],{value:1,type:n.NumberType.Integer,unit:o[4].unit}])]):new e.FunctionNode([n.TokenType.Function,"calc(",o[2],o[3],{value:"calc"}],[n.TokenType.CloseParen,")",o[2],o[3],void 0],[new e.TokenNode([n.TokenType.Ident,r+"infinity",o[2],o[3],{value:r+"infinity"}]),new e.WhitespaceNode([[n.TokenType.Whitespace," ",o[2],o[3],void 0]]),new e.TokenNode([n.TokenType.Delim,"*",o[2],o[3],{value:"*"}]),new e.WhitespaceNode([[n.TokenType.Whitespace," ",o[2],o[3],void 0]]),new e.TokenNode([n.TokenType.Percentage,"1%",o[2],o[3],{value:1}])])}function patchMinusZero(t){if(-1===t)return-1;if(e.isFunctionNode(t))return t;const o=t.value;return n.isTokenNumeric(o)&&Object.is(-0,o[4].value)?("-0"===o[1]||(n.isTokenPercentage(o)?o[1]="-0%":n.isTokenDimension(o)?o[1]="-0"+o[4].unit:o[1]="-0"),t):t}function patchPrecision(t,o=13){if(-1===t)return-1;if(o<=0)return t;if(e.isFunctionNode(t))return t;const r=t.value;if(!n.isTokenNumeric(r))return t;if(Number.isInteger(r[4].value))return t;const i=Number(r[4].value.toFixed(o)).toString();return n.isTokenNumber(r)?r[1]=i:n.isTokenPercentage(r)?r[1]=i+"%":n.isTokenDimension(r)&&(r[1]=i+r[4].unit),t}function patchCanonicalUnit(t){return-1===t?-1:e.isFunctionNode(t)?t:n.isTokenDimension(t.value)?(t.value=toCanonicalUnit(t.value),t):t}function patchCalcResult(e,n){let t=e;return n?.toCanonicalUnits&&(t=patchCanonicalUnit(t)),t=patchPrecision(t,n?.precision),t=patchMinusZero(t),n?.censorIntoStandardRepresentableValues||(t=patchNaN(t),t=patchInfinity(t)),t}function tokenizeGlobals(e){const t=new Map;if(!e)return t;for(const[o,r]of e)if(n.isToken(r))t.set(o,r);else if("string"!=typeof r);else{const e=n.tokenizer({css:r}),i=e.nextToken();if(e.nextToken(),!e.endOfFile())continue;if(!n.isTokenNumeric(i))continue;t.set(o,i)}return t}function calcFromComponentValues(n,t){const o=tokenizeGlobals(t?.globals);return e.replaceComponentValues(n,(n=>{if(!e.isFunctionNode(n))return;const r=b.get(n.getName().toLowerCase());if(!r)return;const i=patchCalcResult(solve(r(n,o,t??{})),t);return-1!==i?i:void 0}))}const h=new Set(b.keys());exports.calc=function calc(t,o){return calcFromComponentValues(e.parseCommaSeparatedListOfComponentValues(n.tokenize({css:t}),{}),o).map((e=>e.map((e=>n.stringify(...e.tokens()))).join(""))).join(",")},exports.calcFromComponentValues=calcFromComponentValues,exports.mathFunctionNames=h;
 
 
 /***/ }),
 
-/***/ 38772:
+/***/ 20243:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 "use strict";
-var e,o,a=__nccwpck_require__(68929),n=__nccwpck_require__(11050),t=__nccwpck_require__(69002),r=__nccwpck_require__(18941);function convertNaNToZero(e){return[Number.isNaN(e[0])?0:e[0],Number.isNaN(e[1])?0:e[1],Number.isNaN(e[2])?0:e[2]]}function colorData_to_XYZ_D50(e){switch(e.colorNotation){case exports.ColorNotation.HEX:case exports.ColorNotation.RGB:case exports.ColorNotation.sRGB:return{...e,colorNotation:exports.ColorNotation.XYZ_D50,channels:n.sRGB_to_XYZ_D50(convertNaNToZero(e.channels))};case exports.ColorNotation.Linear_sRGB:return{...e,colorNotation:exports.ColorNotation.XYZ_D50,channels:n.lin_sRGB_to_XYZ_D50(convertNaNToZero(e.channels))};case exports.ColorNotation.Display_P3:return{...e,colorNotation:exports.ColorNotation.XYZ_D50,channels:n.P3_to_XYZ_D50(convertNaNToZero(e.channels))};case exports.ColorNotation.Linear_Display_P3:return{...e,colorNotation:exports.ColorNotation.XYZ_D50,channels:n.lin_P3_to_XYZ_D50(convertNaNToZero(e.channels))};case exports.ColorNotation.Rec2020:return{...e,colorNotation:exports.ColorNotation.XYZ_D50,channels:n.rec_2020_to_XYZ_D50(convertNaNToZero(e.channels))};case exports.ColorNotation.A98_RGB:return{...e,colorNotation:exports.ColorNotation.XYZ_D50,channels:n.a98_RGB_to_XYZ_D50(convertNaNToZero(e.channels))};case exports.ColorNotation.ProPhoto_RGB:return{...e,colorNotation:exports.ColorNotation.XYZ_D50,channels:n.ProPhoto_RGB_to_XYZ_D50(convertNaNToZero(e.channels))};case exports.ColorNotation.HSL:return{...e,colorNotation:exports.ColorNotation.XYZ_D50,channels:n.HSL_to_XYZ_D50(convertNaNToZero(e.channels))};case exports.ColorNotation.HWB:return{...e,colorNotation:exports.ColorNotation.XYZ_D50,channels:n.HWB_to_XYZ_D50(convertNaNToZero(e.channels))};case exports.ColorNotation.Lab:return{...e,colorNotation:exports.ColorNotation.XYZ_D50,channels:n.Lab_to_XYZ_D50(convertNaNToZero(e.channels))};case exports.ColorNotation.OKLab:return{...e,colorNotation:exports.ColorNotation.XYZ_D50,channels:n.OKLab_to_XYZ_D50(convertNaNToZero(e.channels))};case exports.ColorNotation.LCH:return{...e,colorNotation:exports.ColorNotation.XYZ_D50,channels:n.LCH_to_XYZ_D50(convertNaNToZero(e.channels))};case exports.ColorNotation.OKLCH:return{...e,colorNotation:exports.ColorNotation.XYZ_D50,channels:n.OKLCH_to_XYZ_D50(convertNaNToZero(e.channels))};case exports.ColorNotation.XYZ_D50:return{...e,colorNotation:exports.ColorNotation.XYZ_D50,channels:n.XYZ_D50_to_XYZ_D50(convertNaNToZero(e.channels))};case exports.ColorNotation.XYZ_D65:return{...e,colorNotation:exports.ColorNotation.XYZ_D50,channels:n.XYZ_D65_to_XYZ_D50(convertNaNToZero(e.channels))};default:throw new Error("Unsupported color notation")}}exports.ColorNotation=void 0,(e=exports.ColorNotation||(exports.ColorNotation={})).A98_RGB="a98-rgb",e.Display_P3="display-p3",e.Linear_Display_P3="display-p3-linear",e.HEX="hex",e.HSL="hsl",e.HWB="hwb",e.LCH="lch",e.Lab="lab",e.Linear_sRGB="srgb-linear",e.OKLCH="oklch",e.OKLab="oklab",e.ProPhoto_RGB="prophoto-rgb",e.RGB="rgb",e.sRGB="srgb",e.Rec2020="rec2020",e.XYZ_D50="xyz-d50",e.XYZ_D65="xyz-d65",exports.SyntaxFlag=void 0,(o=exports.SyntaxFlag||(exports.SyntaxFlag={})).ColorKeyword="color-keyword",o.HasAlpha="has-alpha",o.HasDimensionValues="has-dimension-values",o.HasNoneKeywords="has-none-keywords",o.HasNumberValues="has-number-values",o.HasPercentageAlpha="has-percentage-alpha",o.HasPercentageValues="has-percentage-values",o.HasVariableAlpha="has-variable-alpha",o.Hex="hex",o.LegacyHSL="legacy-hsl",o.LegacyRGB="legacy-rgb",o.NamedColor="named-color",o.RelativeColorSyntax="relative-color-syntax",o.ColorMix="color-mix",o.ColorMixVariadic="color-mix-variadic",o.ContrastColor="contrast-color",o.RelativeAlphaSyntax="relative-alpha-syntax",o.Experimental="experimental";const l=new Set([exports.ColorNotation.A98_RGB,exports.ColorNotation.Display_P3,exports.ColorNotation.Linear_Display_P3,exports.ColorNotation.HEX,exports.ColorNotation.Linear_sRGB,exports.ColorNotation.ProPhoto_RGB,exports.ColorNotation.RGB,exports.ColorNotation.sRGB,exports.ColorNotation.Rec2020,exports.ColorNotation.XYZ_D50,exports.ColorNotation.XYZ_D65]);function colorDataTo(e,o){const a={...e};if(e.colorNotation!==o){const e=colorData_to_XYZ_D50(a);switch(o){case exports.ColorNotation.HEX:case exports.ColorNotation.RGB:a.colorNotation=exports.ColorNotation.RGB,a.channels=n.XYZ_D50_to_sRGB(e.channels);break;case exports.ColorNotation.sRGB:a.colorNotation=exports.ColorNotation.sRGB,a.channels=n.XYZ_D50_to_sRGB(e.channels);break;case exports.ColorNotation.Linear_sRGB:a.colorNotation=exports.ColorNotation.Linear_sRGB,a.channels=n.XYZ_D50_to_lin_sRGB(e.channels);break;case exports.ColorNotation.Display_P3:a.colorNotation=exports.ColorNotation.Display_P3,a.channels=n.XYZ_D50_to_P3(e.channels);break;case exports.ColorNotation.Linear_Display_P3:a.colorNotation=exports.ColorNotation.Linear_Display_P3,a.channels=n.XYZ_D50_to_lin_P3(e.channels);break;case exports.ColorNotation.Rec2020:a.colorNotation=exports.ColorNotation.Rec2020,a.channels=n.XYZ_D50_to_rec_2020(e.channels);break;case exports.ColorNotation.ProPhoto_RGB:a.colorNotation=exports.ColorNotation.ProPhoto_RGB,a.channels=n.XYZ_D50_to_ProPhoto(e.channels);break;case exports.ColorNotation.A98_RGB:a.colorNotation=exports.ColorNotation.A98_RGB,a.channels=n.XYZ_D50_to_a98_RGB(e.channels);break;case exports.ColorNotation.HSL:a.colorNotation=exports.ColorNotation.HSL,a.channels=n.XYZ_D50_to_HSL(e.channels);break;case exports.ColorNotation.HWB:a.colorNotation=exports.ColorNotation.HWB,a.channels=n.XYZ_D50_to_HWB(e.channels);break;case exports.ColorNotation.Lab:a.colorNotation=exports.ColorNotation.Lab,a.channels=n.XYZ_D50_to_Lab(e.channels);break;case exports.ColorNotation.LCH:a.colorNotation=exports.ColorNotation.LCH,a.channels=n.XYZ_D50_to_LCH(e.channels);break;case exports.ColorNotation.OKLCH:a.colorNotation=exports.ColorNotation.OKLCH,a.channels=n.XYZ_D50_to_OKLCH(e.channels);break;case exports.ColorNotation.OKLab:a.colorNotation=exports.ColorNotation.OKLab,a.channels=n.XYZ_D50_to_OKLab(e.channels);break;case exports.ColorNotation.XYZ_D50:a.colorNotation=exports.ColorNotation.XYZ_D50,a.channels=n.XYZ_D50_to_XYZ_D50(e.channels);break;case exports.ColorNotation.XYZ_D65:a.colorNotation=exports.ColorNotation.XYZ_D65,a.channels=n.XYZ_D50_to_XYZ_D65(e.channels);break;default:throw new Error("Unsupported color notation")}}else a.channels=convertNaNToZero(e.channels);if(o===e.colorNotation)a.channels=carryForwardMissingComponents(e.channels,[0,1,2],a.channels,[0,1,2]);else if(l.has(o)&&l.has(e.colorNotation))a.channels=carryForwardMissingComponents(e.channels,[0,1,2],a.channels,[0,1,2]);else switch(o){case exports.ColorNotation.HSL:switch(e.colorNotation){case exports.ColorNotation.HWB:a.channels=carryForwardMissingComponents(e.channels,[0],a.channels,[0]);break;case exports.ColorNotation.Lab:case exports.ColorNotation.OKLab:a.channels=carryForwardMissingComponents(e.channels,[2],a.channels,[0]);break;case exports.ColorNotation.LCH:case exports.ColorNotation.OKLCH:a.channels=carryForwardMissingComponents(e.channels,[0,1,2],a.channels,[2,1,0])}break;case exports.ColorNotation.HWB:switch(e.colorNotation){case exports.ColorNotation.HSL:a.channels=carryForwardMissingComponents(e.channels,[0],a.channels,[0]);break;case exports.ColorNotation.LCH:case exports.ColorNotation.OKLCH:a.channels=carryForwardMissingComponents(e.channels,[0],a.channels,[2])}break;case exports.ColorNotation.Lab:case exports.ColorNotation.OKLab:switch(e.colorNotation){case exports.ColorNotation.HSL:a.channels=carryForwardMissingComponents(e.channels,[0],a.channels,[2]);break;case exports.ColorNotation.Lab:case exports.ColorNotation.OKLab:a.channels=carryForwardMissingComponents(e.channels,[0,1,2],a.channels,[0,1,2]);break;case exports.ColorNotation.LCH:case exports.ColorNotation.OKLCH:a.channels=carryForwardMissingComponents(e.channels,[0],a.channels,[0])}break;case exports.ColorNotation.LCH:case exports.ColorNotation.OKLCH:switch(e.colorNotation){case exports.ColorNotation.HSL:a.channels=carryForwardMissingComponents(e.channels,[0,1,2],a.channels,[2,1,0]);break;case exports.ColorNotation.HWB:a.channels=carryForwardMissingComponents(e.channels,[0],a.channels,[2]);break;case exports.ColorNotation.Lab:case exports.ColorNotation.OKLab:a.channels=carryForwardMissingComponents(e.channels,[0],a.channels,[0]);break;case exports.ColorNotation.LCH:case exports.ColorNotation.OKLCH:a.channels=carryForwardMissingComponents(e.channels,[0,1,2],a.channels,[0,1,2])}}return a.channels=convertPowerlessComponentsToMissingComponents(a.channels,o),a}function convertPowerlessComponentsToMissingComponents(e,o){const a=[...e];switch(o){case exports.ColorNotation.HSL:!Number.isNaN(a[1])&&reducePrecision(a[1],4)<=0&&(a[0]=Number.NaN);break;case exports.ColorNotation.HWB:Math.max(0,reducePrecision(a[1],4))+Math.max(0,reducePrecision(a[2],4))>=100&&(a[0]=Number.NaN);break;case exports.ColorNotation.LCH:!Number.isNaN(a[1])&&reducePrecision(a[1],4)<=0&&(a[2]=Number.NaN);break;case exports.ColorNotation.OKLCH:!Number.isNaN(a[1])&&reducePrecision(a[1],6)<=0&&(a[2]=Number.NaN)}return a}function convertPowerlessComponentsToZeroValuesForDisplay(e,o){const a=[...e];switch(o){case exports.ColorNotation.HSL:(reducePrecision(a[2])<=0||reducePrecision(a[2])>=100)&&(a[0]=Number.NaN,a[1]=Number.NaN),reducePrecision(a[1])<=0&&(a[0]=Number.NaN);break;case exports.ColorNotation.HWB:Math.max(0,reducePrecision(a[1]))+Math.max(0,reducePrecision(a[2]))>=100&&(a[0]=Number.NaN);break;case exports.ColorNotation.Lab:(reducePrecision(a[0])<=0||reducePrecision(a[0])>=100)&&(a[1]=Number.NaN,a[2]=Number.NaN);break;case exports.ColorNotation.LCH:reducePrecision(a[1])<=0&&(a[2]=Number.NaN),(reducePrecision(a[0])<=0||reducePrecision(a[0])>=100)&&(a[1]=Number.NaN,a[2]=Number.NaN);break;case exports.ColorNotation.OKLab:(reducePrecision(a[0])<=0||reducePrecision(a[0])>=1)&&(a[1]=Number.NaN,a[2]=Number.NaN);break;case exports.ColorNotation.OKLCH:reducePrecision(a[1])<=0&&(a[2]=Number.NaN),(reducePrecision(a[0])<=0||reducePrecision(a[0])>=1)&&(a[1]=Number.NaN,a[2]=Number.NaN)}return a}function carryForwardMissingComponents(e,o,a,n){const t=[...a];for(const a of o)Number.isNaN(e[o[a]])&&(t[n[a]]=Number.NaN);return t}function normalizeRelativeColorDataChannels(e){const o=new Map;switch(e.colorNotation){case exports.ColorNotation.RGB:case exports.ColorNotation.HEX:o.set("r",dummyNumberToken(255*e.channels[0])),o.set("g",dummyNumberToken(255*e.channels[1])),o.set("b",dummyNumberToken(255*e.channels[2])),"number"==typeof e.alpha&&o.set("alpha",dummyNumberToken(e.alpha));break;case exports.ColorNotation.HSL:o.set("h",dummyNumberToken(e.channels[0])),o.set("s",dummyNumberToken(e.channels[1])),o.set("l",dummyNumberToken(e.channels[2])),"number"==typeof e.alpha&&o.set("alpha",dummyNumberToken(e.alpha));break;case exports.ColorNotation.HWB:o.set("h",dummyNumberToken(e.channels[0])),o.set("w",dummyNumberToken(e.channels[1])),o.set("b",dummyNumberToken(e.channels[2])),"number"==typeof e.alpha&&o.set("alpha",dummyNumberToken(e.alpha));break;case exports.ColorNotation.Lab:case exports.ColorNotation.OKLab:o.set("l",dummyNumberToken(e.channels[0])),o.set("a",dummyNumberToken(e.channels[1])),o.set("b",dummyNumberToken(e.channels[2])),"number"==typeof e.alpha&&o.set("alpha",dummyNumberToken(e.alpha));break;case exports.ColorNotation.LCH:case exports.ColorNotation.OKLCH:o.set("l",dummyNumberToken(e.channels[0])),o.set("c",dummyNumberToken(e.channels[1])),o.set("h",dummyNumberToken(e.channels[2])),"number"==typeof e.alpha&&o.set("alpha",dummyNumberToken(e.alpha));break;case exports.ColorNotation.sRGB:case exports.ColorNotation.A98_RGB:case exports.ColorNotation.Display_P3:case exports.ColorNotation.Linear_Display_P3:case exports.ColorNotation.Rec2020:case exports.ColorNotation.Linear_sRGB:case exports.ColorNotation.ProPhoto_RGB:o.set("r",dummyNumberToken(e.channels[0])),o.set("g",dummyNumberToken(e.channels[1])),o.set("b",dummyNumberToken(e.channels[2])),"number"==typeof e.alpha&&o.set("alpha",dummyNumberToken(e.alpha));break;case exports.ColorNotation.XYZ_D50:case exports.ColorNotation.XYZ_D65:o.set("x",dummyNumberToken(e.channels[0])),o.set("y",dummyNumberToken(e.channels[1])),o.set("z",dummyNumberToken(e.channels[2])),"number"==typeof e.alpha&&o.set("alpha",dummyNumberToken(e.alpha))}return o}function noneToZeroInRelativeColorDataChannels(e){const o=new Map(e);for(const[a,n]of e)Number.isNaN(n[4].value)&&o.set(a,dummyNumberToken(0));return o}function dummyNumberToken(e){return Number.isNaN(e)?[a.TokenType.Number,"none",-1,-1,{value:Number.NaN,type:a.NumberType.Number}]:[a.TokenType.Number,e.toString(),-1,-1,{value:e,type:a.NumberType.Number}]}function reducePrecision(e,o=7){if(Number.isNaN(e))return 0;const a=Math.pow(10,o);return Math.round(e*a)/a}function normalize(e,o,a,n){return Math.min(Math.max(e/o,a),n)}const s=/[A-Z]/g;function toLowerCaseAZ(e){return e.replace(s,e=>String.fromCharCode(e.charCodeAt(0)+32))}function normalize_Color_ChannelValues(e,o,n){if(a.isTokenIdent(e)&&"none"===toLowerCaseAZ(e[4].value))return n.syntaxFlags.add(exports.SyntaxFlag.HasNoneKeywords),[a.TokenType.Number,"none",e[2],e[3],{value:Number.NaN,type:a.NumberType.Number}];if(a.isTokenPercentage(e)){3!==o&&n.syntaxFlags.add(exports.SyntaxFlag.HasPercentageValues);let t=normalize(e[4].value,100,-2147483647,2147483647);return 3===o&&(t=normalize(e[4].value,100,0,1)),[a.TokenType.Number,t.toString(),e[2],e[3],{value:t,type:a.NumberType.Number}]}if(a.isTokenNumber(e)){3!==o&&n.syntaxFlags.add(exports.SyntaxFlag.HasNumberValues);let t=normalize(e[4].value,1,-2147483647,2147483647);return 3===o&&(t=normalize(e[4].value,1,0,1)),[a.TokenType.Number,t.toString(),e[2],e[3],{value:t,type:a.NumberType.Number}]}return!1}const i=new Set(["srgb","srgb-linear","display-p3","display-p3-linear","a98-rgb","prophoto-rgb","rec2020","xyz","xyz-d50","xyz-d65"]);function color$1(e,o){const n=[],l=[],s=[],u=[];let c,p,N=!1,m=!1;const h={colorNotation:exports.ColorNotation.sRGB,channels:[0,0,0],alpha:1,syntaxFlags:new Set([])};let x=n;for(let y=0;y<e.value.length;y++){let b=e.value[y];if(t.isWhitespaceNode(b)||t.isCommentNode(b))for(;t.isWhitespaceNode(e.value[y+1])||t.isCommentNode(e.value[y+1]);)y++;else if(x===n&&n.length&&(x=l),x===l&&l.length&&(x=s),t.isTokenNode(b)&&a.isTokenDelim(b.value)&&"/"===b.value[4].value){if(x===u)return!1;x=u}else{if(t.isFunctionNode(b)){if(x===u&&"var"===toLowerCaseAZ(b.getName())){h.syntaxFlags.add(exports.SyntaxFlag.HasVariableAlpha),x.push(b);continue}if(!r.mathFunctionNames.has(toLowerCaseAZ(b.getName())))return!1;const[[e]]=r.calcFromComponentValues([[b]],{censorIntoStandardRepresentableValues:!0,globals:p,precision:-1,toCanonicalUnits:!0,rawPercentages:!0});if(!e||!t.isTokenNode(e)||!a.isTokenNumeric(e.value))return!1;Number.isNaN(e.value[4].value)&&(e.value[4].value=0),b=e}if(x===n&&0===n.length&&t.isTokenNode(b)&&a.isTokenIdent(b.value)&&i.has(toLowerCaseAZ(b.value[4].value))){if(N)return!1;N=toLowerCaseAZ(b.value[4].value),h.colorNotation=colorSpaceNameToColorNotation(N),m&&(m.colorNotation!==h.colorNotation&&(m=colorDataTo(m,h.colorNotation)),c=normalizeRelativeColorDataChannels(m),p=noneToZeroInRelativeColorDataChannels(c))}else if(x===n&&0===n.length&&t.isTokenNode(b)&&a.isTokenIdent(b.value)&&"from"===toLowerCaseAZ(b.value[4].value)){if(m)return!1;if(N)return!1;for(;t.isWhitespaceNode(e.value[y+1])||t.isCommentNode(e.value[y+1]);)y++;if(y++,b=e.value[y],m=o(b),!1===m)return!1;m.syntaxFlags.has(exports.SyntaxFlag.Experimental)&&h.syntaxFlags.add(exports.SyntaxFlag.Experimental),h.syntaxFlags.add(exports.SyntaxFlag.RelativeColorSyntax)}else{if(!t.isTokenNode(b))return!1;if(a.isTokenIdent(b.value)&&c&&c.has(toLowerCaseAZ(b.value[4].value))){x.push(new t.TokenNode(c.get(toLowerCaseAZ(b.value[4].value))));continue}x.push(b)}}}if(!N)return!1;if(1!==x.length)return!1;if(1!==n.length||1!==l.length||1!==s.length)return!1;if(!t.isTokenNode(n[0])||!t.isTokenNode(l[0])||!t.isTokenNode(s[0]))return!1;if(c&&!c.has("alpha"))return!1;const y=normalize_Color_ChannelValues(n[0].value,0,h);if(!y||!a.isTokenNumber(y))return!1;const b=normalize_Color_ChannelValues(l[0].value,1,h);if(!b||!a.isTokenNumber(b))return!1;const C=normalize_Color_ChannelValues(s[0].value,2,h);if(!C||!a.isTokenNumber(C))return!1;const d=[y,b,C];if(1===u.length)if(h.syntaxFlags.add(exports.SyntaxFlag.HasAlpha),t.isTokenNode(u[0])){const e=normalize_Color_ChannelValues(u[0].value,3,h);if(!e||!a.isTokenNumber(e))return!1;d.push(e)}else h.alpha=u[0];else if(c&&c.has("alpha")){const e=normalize_Color_ChannelValues(c.get("alpha"),3,h);if(!e||!a.isTokenNumber(e))return!1;d.push(e)}return h.channels=[d[0][4].value,d[1][4].value,d[2][4].value],4===d.length&&(h.alpha=d[3][4].value),h}function colorSpaceNameToColorNotation(e){switch(e){case"srgb":return exports.ColorNotation.sRGB;case"srgb-linear":return exports.ColorNotation.Linear_sRGB;case"display-p3":return exports.ColorNotation.Display_P3;case"display-p3-linear":return exports.ColorNotation.Linear_Display_P3;case"a98-rgb":return exports.ColorNotation.A98_RGB;case"prophoto-rgb":return exports.ColorNotation.ProPhoto_RGB;case"rec2020":return exports.ColorNotation.Rec2020;case"xyz":case"xyz-d65":return exports.ColorNotation.XYZ_D65;case"xyz-d50":return exports.ColorNotation.XYZ_D50;default:throw new Error("Unknown color space name: "+e)}}const u=new Set(["srgb","srgb-linear","display-p3","display-p3-linear","a98-rgb","prophoto-rgb","rec2020","lab","oklab","xyz","xyz-d50","xyz-d65"]),c=new Set(["hsl","hwb","lch","oklch"]),p=new Set(["shorter","longer","increasing","decreasing"]);function colorMix(e,o){let n=null,r=null,l=null,s=!1;for(let i=0;i<e.value.length;i++){const N=e.value[i];if(!t.isWhiteSpaceOrCommentNode(N)){if(!(n||t.isTokenNode(N)&&a.isTokenIdent(N.value)&&"in"===toLowerCaseAZ(N.value[4].value)))return colorMixRectangular("oklab",colorMixComponents(e.value,o));if(t.isTokenNode(N)&&a.isTokenIdent(N.value)){if(!n&&"in"===toLowerCaseAZ(N.value[4].value)){n=N;continue}if(n&&!r){r=toLowerCaseAZ(N.value[4].value);continue}if(n&&r&&!l&&c.has(r)){l=toLowerCaseAZ(N.value[4].value);continue}if(n&&r&&l&&!s&&"hue"===toLowerCaseAZ(N.value[4].value)){s=!0;continue}return!1}return!(!t.isTokenNode(N)||!a.isTokenComma(N.value))&&(!!r&&(l||s?!!(r&&l&&s&&c.has(r)&&p.has(l))&&colorMixPolar(r,l,colorMixComponents(e.value.slice(i+1),o)):u.has(r)?colorMixRectangular(r,colorMixComponents(e.value.slice(i+1),o)):!!c.has(r)&&colorMixPolar(r,"shorter",colorMixComponents(e.value.slice(i+1),o))))}}return!1}function colorMixComponents(e,o){const n=[];let l=1,s=!1,i=!1;for(let l=0;l<e.length;l++){let u=e[l];if(!t.isWhiteSpaceOrCommentNode(u)){if(!t.isTokenNode(u)||!a.isTokenComma(u.value)){if(!s){const e=o(u);if(e){s=e;continue}}if(!i){if(t.isFunctionNode(u)&&r.mathFunctionNames.has(toLowerCaseAZ(u.getName()))){if([[u]]=r.calcFromComponentValues([[u]],{censorIntoStandardRepresentableValues:!0,precision:-1,toCanonicalUnits:!0,rawPercentages:!0}),!u||!t.isTokenNode(u)||!a.isTokenNumeric(u.value))return!1;Number.isNaN(u.value[4].value)&&(u.value[4].value=0)}if(t.isTokenNode(u)&&a.isTokenPercentage(u.value)&&u.value[4].value>=0){i=u.value[4].value;continue}}return!1}if(!s)return!1;n.push({color:s,percentage:i}),s=!1,i=!1}}if(!s)return!1;n.push({color:s,percentage:i});let u=0,c=0;for(let e=0;e<n.length;e++){const o=n[e].percentage;if(!1!==o){if(o<0||o>100)return!1;u+=o}else c++}const p=Math.max(0,100-u);u=0;for(let e=0;e<n.length;e++)!1===n[e].percentage&&(n[e].percentage=p/c),u+=n[e].percentage;if(0===u)return{colors:[{color:{channels:[0,0,0],colorNotation:exports.ColorNotation.sRGB,alpha:0,syntaxFlags:new Set},percentage:0}],alphaMultiplier:0};if(u>100)for(let e=0;e<n.length;e++){let o=n[e].percentage;o=o/u*100,n[e].percentage=o}if(u<100){l=u/100;for(let e=0;e<n.length;e++){let o=n[e].percentage;o=o/u*100,n[e].percentage=o}}return{colors:n,alphaMultiplier:l}}function colorMixRectangular(e,o){if(!o||!o.colors.length)return!1;const a=o.colors.slice();a.reverse();let n=exports.ColorNotation.RGB;switch(e){case"srgb":n=exports.ColorNotation.RGB;break;case"srgb-linear":n=exports.ColorNotation.Linear_sRGB;break;case"display-p3":n=exports.ColorNotation.Display_P3;break;case"display-p3-linear":n=exports.ColorNotation.Linear_Display_P3;break;case"a98-rgb":n=exports.ColorNotation.A98_RGB;break;case"prophoto-rgb":n=exports.ColorNotation.ProPhoto_RGB;break;case"rec2020":n=exports.ColorNotation.Rec2020;break;case"lab":n=exports.ColorNotation.Lab;break;case"oklab":n=exports.ColorNotation.OKLab;break;case"xyz-d50":n=exports.ColorNotation.XYZ_D50;break;case"xyz":case"xyz-d65":n=exports.ColorNotation.XYZ_D65;break;default:return!1}if(1===a.length){const e=colorDataTo(a[0].color,n);return e.colorNotation=n,e.syntaxFlags.add(exports.SyntaxFlag.ColorMixVariadic),"number"!=typeof e.alpha?!1:(e.alpha=e.alpha*o.alphaMultiplier,e)}for(;a.length>=2;){const e=a.pop(),o=a.pop();if(!e||!o)return!1;const t=colorMixRectangularPair(n,e.color,e.percentage,o.color,o.percentage);if(!t)return!1;a.push({color:t,percentage:e.percentage+o.percentage})}const t=a[0]?.color;return!!t&&(o.colors.some(e=>e.color.syntaxFlags.has(exports.SyntaxFlag.Experimental))&&t.syntaxFlags.add(exports.SyntaxFlag.Experimental),"number"==typeof t.alpha&&(t.alpha=t.alpha*o.alphaMultiplier,2!==o.colors.length&&t.syntaxFlags.add(exports.SyntaxFlag.ColorMixVariadic),t))}function colorMixRectangularPair(e,o,a,n,t){const r=a/(a+t);let l=o.alpha;if("number"!=typeof l)return!1;let s=n.alpha;if("number"!=typeof s)return!1;l=Number.isNaN(l)?s:l,s=Number.isNaN(s)?l:s;const i=colorDataTo(o,e).channels,u=colorDataTo(n,e).channels;i[0]=fillInMissingComponent(i[0],u[0]),u[0]=fillInMissingComponent(u[0],i[0]),i[1]=fillInMissingComponent(i[1],u[1]),u[1]=fillInMissingComponent(u[1],i[1]),i[2]=fillInMissingComponent(i[2],u[2]),u[2]=fillInMissingComponent(u[2],i[2]),i[0]=premultiply(i[0],l),i[1]=premultiply(i[1],l),i[2]=premultiply(i[2],l),u[0]=premultiply(u[0],s),u[1]=premultiply(u[1],s),u[2]=premultiply(u[2],s);const c=interpolate(l,s,r);return{colorNotation:e,channels:[un_premultiply(interpolate(i[0],u[0],r),c),un_premultiply(interpolate(i[1],u[1],r),c),un_premultiply(interpolate(i[2],u[2],r),c)],alpha:c,syntaxFlags:new Set([exports.SyntaxFlag.ColorMix])}}function colorMixPolar(e,o,a){if(!a||!a.colors.length)return!1;const n=a.colors.slice();n.reverse();let t=exports.ColorNotation.HSL;switch(e){case"hsl":t=exports.ColorNotation.HSL;break;case"hwb":t=exports.ColorNotation.HWB;break;case"lch":t=exports.ColorNotation.LCH;break;case"oklch":t=exports.ColorNotation.OKLCH;break;default:return!1}if(1===n.length){const e=colorDataTo(n[0].color,t);return e.colorNotation=t,e.syntaxFlags.add(exports.SyntaxFlag.ColorMixVariadic),"number"!=typeof e.alpha?!1:(e.alpha=e.alpha*a.alphaMultiplier,e)}for(;n.length>=2;){const e=n.pop(),a=n.pop();if(!e||!a)return!1;const r=colorMixPolarPair(t,o,e.color,e.percentage,a.color,a.percentage);if(!r)return!1;n.push({color:r,percentage:e.percentage+a.percentage})}const r=n[0]?.color;return!!r&&(a.colors.some(e=>e.color.syntaxFlags.has(exports.SyntaxFlag.Experimental))&&r.syntaxFlags.add(exports.SyntaxFlag.Experimental),"number"==typeof r.alpha&&(r.alpha=r.alpha*a.alphaMultiplier,2!==a.colors.length&&r.syntaxFlags.add(exports.SyntaxFlag.ColorMixVariadic),r))}function colorMixPolarPair(e,o,a,n,t,r){const l=n/(n+r);let s=0,i=0,u=0,c=0,p=0,N=0,m=a.alpha;if("number"!=typeof m)return!1;let h=t.alpha;if("number"!=typeof h)return!1;m=Number.isNaN(m)?h:m,h=Number.isNaN(h)?m:h;const x=colorDataTo(a,e).channels,y=colorDataTo(t,e).channels;switch(e){case exports.ColorNotation.HSL:case exports.ColorNotation.HWB:s=x[0],i=y[0],u=x[1],c=y[1],p=x[2],N=y[2];break;case exports.ColorNotation.LCH:case exports.ColorNotation.OKLCH:u=x[0],c=y[0],p=x[1],N=y[1],s=x[2],i=y[2]}s=fillInMissingComponent(s,i),Number.isNaN(s)&&(s=0),i=fillInMissingComponent(i,s),Number.isNaN(i)&&(i=0),u=fillInMissingComponent(u,c),c=fillInMissingComponent(c,u),p=fillInMissingComponent(p,N),N=fillInMissingComponent(N,p);const b=i-s;switch(o){case"shorter":b>180?s+=360:b<-180&&(i+=360);break;case"longer":-180<b&&b<180&&(b>0?s+=360:i+=360);break;case"increasing":b<0&&(i+=360);break;case"decreasing":b>0&&(s+=360);break;default:throw new Error("Unknown hue interpolation method")}u=premultiply(u,m),p=premultiply(p,m),c=premultiply(c,h),N=premultiply(N,h);let C=[0,0,0];const d=interpolate(m,h,l);switch(e){case exports.ColorNotation.HSL:case exports.ColorNotation.HWB:C=[interpolate(s,i,l),un_premultiply(interpolate(u,c,l),d),un_premultiply(interpolate(p,N,l),d)];break;case exports.ColorNotation.LCH:case exports.ColorNotation.OKLCH:C=[un_premultiply(interpolate(u,c,l),d),un_premultiply(interpolate(p,N,l),d),interpolate(s,i,l)]}return{colorNotation:e,channels:C,alpha:d,syntaxFlags:new Set([exports.SyntaxFlag.ColorMix])}}function fillInMissingComponent(e,o){return Number.isNaN(e)?o:e}function interpolate(e,o,a){return e*a+o*(1-a)}function premultiply(e,o){return Number.isNaN(o)?e:Number.isNaN(e)?Number.NaN:e*o}function un_premultiply(e,o){return 0===o||Number.isNaN(o)?e:Number.isNaN(e)?Number.NaN:e/o}function hex(e){const o=toLowerCaseAZ(e[4].value);if(o.match(/[^a-f0-9]/))return!1;const a={colorNotation:exports.ColorNotation.HEX,channels:[0,0,0],alpha:1,syntaxFlags:new Set([exports.SyntaxFlag.Hex])},n=o.length;if(3===n){const e=o[0],n=o[1],t=o[2];return a.channels=[parseInt(e+e,16)/255,parseInt(n+n,16)/255,parseInt(t+t,16)/255],a}if(6===n){const e=o[0]+o[1],n=o[2]+o[3],t=o[4]+o[5];return a.channels=[parseInt(e,16)/255,parseInt(n,16)/255,parseInt(t,16)/255],a}if(4===n){const e=o[0],n=o[1],t=o[2],r=o[3];return a.channels=[parseInt(e+e,16)/255,parseInt(n+n,16)/255,parseInt(t+t,16)/255],a.alpha=parseInt(r+r,16)/255,a.syntaxFlags.add(exports.SyntaxFlag.HasAlpha),a}if(8===n){const e=o[0]+o[1],n=o[2]+o[3],t=o[4]+o[5],r=o[6]+o[7];return a.channels=[parseInt(e,16)/255,parseInt(n,16)/255,parseInt(t,16)/255],a.alpha=parseInt(r,16)/255,a.syntaxFlags.add(exports.SyntaxFlag.HasAlpha),a}return!1}function normalizeHue(e){if(a.isTokenNumber(e))return e[4].value=e[4].value%360,e[1]=e[4].value.toString(),e;if(a.isTokenDimension(e)){let o=e[4].value;switch(toLowerCaseAZ(e[4].unit)){case"deg":break;case"rad":o=180*e[4].value/Math.PI;break;case"grad":o=.9*e[4].value;break;case"turn":o=360*e[4].value;break;default:return!1}return o%=360,[a.TokenType.Number,o.toString(),e[2],e[3],{value:o,type:a.NumberType.Number}]}return!1}function normalize_legacy_HSL_ChannelValues(e,o,n){if(0===o){const o=normalizeHue(e);return!1!==o&&(a.isTokenDimension(e)&&n.syntaxFlags.add(exports.SyntaxFlag.HasDimensionValues),o)}if(a.isTokenPercentage(e)){3===o?n.syntaxFlags.add(exports.SyntaxFlag.HasPercentageAlpha):n.syntaxFlags.add(exports.SyntaxFlag.HasPercentageValues);let t=normalize(e[4].value,1,0,100);return 3===o&&(t=normalize(e[4].value,100,0,1)),[a.TokenType.Number,t.toString(),e[2],e[3],{value:t,type:a.NumberType.Number}]}if(a.isTokenNumber(e)){if(3!==o)return!1;let n=normalize(e[4].value,1,0,100);return 3===o&&(n=normalize(e[4].value,1,0,1)),[a.TokenType.Number,n.toString(),e[2],e[3],{value:n,type:a.NumberType.Number}]}return!1}function normalize_modern_HSL_ChannelValues(e,o,n){if(a.isTokenIdent(e)&&"none"===toLowerCaseAZ(e[4].value))return n.syntaxFlags.add(exports.SyntaxFlag.HasNoneKeywords),[a.TokenType.Number,"none",e[2],e[3],{value:Number.NaN,type:a.NumberType.Number}];if(0===o){const o=normalizeHue(e);return!1!==o&&(a.isTokenDimension(e)&&n.syntaxFlags.add(exports.SyntaxFlag.HasDimensionValues),o)}if(a.isTokenPercentage(e)){3===o?n.syntaxFlags.add(exports.SyntaxFlag.HasPercentageAlpha):n.syntaxFlags.add(exports.SyntaxFlag.HasPercentageValues);let t=e[4].value;return 3===o?t=normalize(e[4].value,100,0,1):1===o&&(t=normalize(e[4].value,1,0,2147483647)),[a.TokenType.Number,t.toString(),e[2],e[3],{value:t,type:a.NumberType.Number}]}if(a.isTokenNumber(e)){3!==o&&n.syntaxFlags.add(exports.SyntaxFlag.HasNumberValues);let t=e[4].value;return 3===o?t=normalize(e[4].value,1,0,1):1===o&&(t=normalize(e[4].value,1,0,2147483647)),[a.TokenType.Number,t.toString(),e[2],e[3],{value:t,type:a.NumberType.Number}]}return!1}function threeChannelLegacySyntax(e,o,n,l){const s=[],i=[],u=[],c=[],p={colorNotation:n,channels:[0,0,0],alpha:1,syntaxFlags:new Set(l)};let N=s;for(let o=0;o<e.value.length;o++){let n=e.value[o];if(!t.isWhitespaceNode(n)&&!t.isCommentNode(n)){if(t.isTokenNode(n)&&a.isTokenComma(n.value)){if(N===s){N=i;continue}if(N===i){N=u;continue}if(N===u){N=c;continue}if(N===c)return!1}if(t.isFunctionNode(n)){if(N===c&&"var"===n.getName().toLowerCase()){p.syntaxFlags.add(exports.SyntaxFlag.HasVariableAlpha),N.push(n);continue}if(!r.mathFunctionNames.has(n.getName().toLowerCase()))return!1;const[[e]]=r.calcFromComponentValues([[n]],{censorIntoStandardRepresentableValues:!0,precision:-1,toCanonicalUnits:!0,rawPercentages:!0});if(!e||!t.isTokenNode(e)||!a.isTokenNumeric(e.value))return!1;Number.isNaN(e.value[4].value)&&(e.value[4].value=0),n=e}if(!t.isTokenNode(n))return!1;N.push(n)}}if(1!==N.length)return!1;if(1!==s.length||1!==i.length||1!==u.length)return!1;if(!t.isTokenNode(s[0])||!t.isTokenNode(i[0])||!t.isTokenNode(u[0]))return!1;const m=o(s[0].value,0,p);if(!m||!a.isTokenNumber(m))return!1;const h=o(i[0].value,1,p);if(!h||!a.isTokenNumber(h))return!1;const x=o(u[0].value,2,p);if(!x||!a.isTokenNumber(x))return!1;const y=[m,h,x];if(1===c.length)if(p.syntaxFlags.add(exports.SyntaxFlag.HasAlpha),t.isTokenNode(c[0])){const e=o(c[0].value,3,p);if(!e||!a.isTokenNumber(e))return!1;y.push(e)}else p.alpha=c[0];return p.channels=[y[0][4].value,y[1][4].value,y[2][4].value],4===y.length&&(p.alpha=y[3][4].value),p}function threeChannelSpaceSeparated(e,o,n,l,s){const i=[],u=[],c=[],p=[];let N,m,h=!1;const x={colorNotation:n,channels:[0,0,0],alpha:1,syntaxFlags:new Set(l)};let y=i;for(let o=0;o<e.value.length;o++){let l=e.value[o];if(t.isWhitespaceNode(l)||t.isCommentNode(l))for(;t.isWhitespaceNode(e.value[o+1])||t.isCommentNode(e.value[o+1]);)o++;else if(y===i&&i.length&&(y=u),y===u&&u.length&&(y=c),t.isTokenNode(l)&&a.isTokenDelim(l.value)&&"/"===l.value[4].value){if(y===p)return!1;y=p}else{if(t.isFunctionNode(l)){if(y===p&&"var"===l.getName().toLowerCase()){x.syntaxFlags.add(exports.SyntaxFlag.HasVariableAlpha),y.push(l);continue}if(!r.mathFunctionNames.has(l.getName().toLowerCase()))return!1;const[[e]]=r.calcFromComponentValues([[l]],{censorIntoStandardRepresentableValues:!0,globals:m,precision:-1,toCanonicalUnits:!0,rawPercentages:!0});if(!e||!t.isTokenNode(e)||!a.isTokenNumeric(e.value))return!1;Number.isNaN(e.value[4].value)&&(e.value[4].value=0),l=e}if(y===i&&0===i.length&&t.isTokenNode(l)&&a.isTokenIdent(l.value)&&"from"===l.value[4].value.toLowerCase()){if(h)return!1;for(;t.isWhitespaceNode(e.value[o+1])||t.isCommentNode(e.value[o+1]);)o++;if(o++,l=e.value[o],h=s(l),!1===h)return!1;h.syntaxFlags.has(exports.SyntaxFlag.Experimental)&&x.syntaxFlags.add(exports.SyntaxFlag.Experimental),x.syntaxFlags.add(exports.SyntaxFlag.RelativeColorSyntax),h.colorNotation!==n&&(h=colorDataTo(h,n)),N=normalizeRelativeColorDataChannels(h),m=noneToZeroInRelativeColorDataChannels(N)}else{if(!t.isTokenNode(l))return!1;if(a.isTokenIdent(l.value)&&N){const e=l.value[4].value.toLowerCase();if(N.has(e)){y.push(new t.TokenNode(N.get(e)));continue}}y.push(l)}}}if(1!==y.length)return!1;if(1!==i.length||1!==u.length||1!==c.length)return!1;if(!t.isTokenNode(i[0])||!t.isTokenNode(u[0])||!t.isTokenNode(c[0]))return!1;if(N&&!N.has("alpha"))return!1;const b=o(i[0].value,0,x);if(!b||!a.isTokenNumber(b))return!1;const C=o(u[0].value,1,x);if(!C||!a.isTokenNumber(C))return!1;const d=o(c[0].value,2,x);if(!d||!a.isTokenNumber(d))return!1;const g=[b,C,d];if(1===p.length)if(x.syntaxFlags.add(exports.SyntaxFlag.HasAlpha),t.isTokenNode(p[0])){const e=o(p[0].value,3,x);if(!e||!a.isTokenNumber(e))return!1;g.push(e)}else x.alpha=p[0];else if(N&&N.has("alpha")){const e=o(N.get("alpha"),3,x);if(!e||!a.isTokenNumber(e))return!1;g.push(e)}return x.channels=[g[0][4].value,g[1][4].value,g[2][4].value],4===g.length&&(x.alpha=g[3][4].value),x}function hsl(e,o){if(e.value.some(e=>t.isTokenNode(e)&&a.isTokenComma(e.value))){const o=hslCommaSeparated(e);if(!1!==o)return o}{const a=hslSpaceSeparated(e,o);if(!1!==a)return a}return!1}function hslCommaSeparated(e){return threeChannelLegacySyntax(e,normalize_legacy_HSL_ChannelValues,exports.ColorNotation.HSL,[exports.SyntaxFlag.LegacyHSL])}function hslSpaceSeparated(e,o){return threeChannelSpaceSeparated(e,normalize_modern_HSL_ChannelValues,exports.ColorNotation.HSL,[],o)}function normalize_HWB_ChannelValues(e,o,n){if(a.isTokenIdent(e)&&"none"===toLowerCaseAZ(e[4].value))return n.syntaxFlags.add(exports.SyntaxFlag.HasNoneKeywords),[a.TokenType.Number,"none",e[2],e[3],{value:Number.NaN,type:a.NumberType.Number}];if(0===o){const o=normalizeHue(e);return!1!==o&&(a.isTokenDimension(e)&&n.syntaxFlags.add(exports.SyntaxFlag.HasDimensionValues),o)}if(a.isTokenPercentage(e)){3===o?n.syntaxFlags.add(exports.SyntaxFlag.HasPercentageAlpha):n.syntaxFlags.add(exports.SyntaxFlag.HasPercentageValues);let t=e[4].value;return 3===o&&(t=normalize(e[4].value,100,0,1)),[a.TokenType.Number,t.toString(),e[2],e[3],{value:t,type:a.NumberType.Number}]}if(a.isTokenNumber(e)){3!==o&&n.syntaxFlags.add(exports.SyntaxFlag.HasNumberValues);let t=e[4].value;return 3===o&&(t=normalize(e[4].value,1,0,1)),[a.TokenType.Number,t.toString(),e[2],e[3],{value:t,type:a.NumberType.Number}]}return!1}function normalize_Lab_ChannelValues(e,o,n){if(a.isTokenIdent(e)&&"none"===toLowerCaseAZ(e[4].value))return n.syntaxFlags.add(exports.SyntaxFlag.HasNoneKeywords),[a.TokenType.Number,"none",e[2],e[3],{value:Number.NaN,type:a.NumberType.Number}];if(a.isTokenPercentage(e)){3!==o&&n.syntaxFlags.add(exports.SyntaxFlag.HasPercentageValues);let t=normalize(e[4].value,1,0,100);return 1===o||2===o?t=normalize(e[4].value,.8,-2147483647,2147483647):3===o&&(t=normalize(e[4].value,100,0,1)),[a.TokenType.Number,t.toString(),e[2],e[3],{value:t,type:a.NumberType.Number}]}if(a.isTokenNumber(e)){3!==o&&n.syntaxFlags.add(exports.SyntaxFlag.HasNumberValues);let t=normalize(e[4].value,1,0,100);return 1===o||2===o?t=normalize(e[4].value,1,-2147483647,2147483647):3===o&&(t=normalize(e[4].value,1,0,1)),[a.TokenType.Number,t.toString(),e[2],e[3],{value:t,type:a.NumberType.Number}]}return!1}function lab(e,o){return threeChannelSpaceSeparated(e,normalize_Lab_ChannelValues,exports.ColorNotation.Lab,[],o)}function normalize_LCH_ChannelValues(e,o,n){if(a.isTokenIdent(e)&&"none"===toLowerCaseAZ(e[4].value))return n.syntaxFlags.add(exports.SyntaxFlag.HasNoneKeywords),[a.TokenType.Number,"none",e[2],e[3],{value:Number.NaN,type:a.NumberType.Number}];if(2===o){const o=normalizeHue(e);return!1!==o&&(a.isTokenDimension(e)&&n.syntaxFlags.add(exports.SyntaxFlag.HasDimensionValues),o)}if(a.isTokenPercentage(e)){3!==o&&n.syntaxFlags.add(exports.SyntaxFlag.HasPercentageValues);let t=normalize(e[4].value,1,0,100);return 1===o?t=normalize(e[4].value,100/150,0,2147483647):3===o&&(t=normalize(e[4].value,100,0,1)),[a.TokenType.Number,t.toString(),e[2],e[3],{value:t,type:a.NumberType.Number}]}if(a.isTokenNumber(e)){3!==o&&n.syntaxFlags.add(exports.SyntaxFlag.HasNumberValues);let t=normalize(e[4].value,1,0,100);return 1===o?t=normalize(e[4].value,1,0,2147483647):3===o&&(t=normalize(e[4].value,1,0,1)),[a.TokenType.Number,t.toString(),e[2],e[3],{value:t,type:a.NumberType.Number}]}return!1}function lch(e,o){return threeChannelSpaceSeparated(e,normalize_LCH_ChannelValues,exports.ColorNotation.LCH,[],o)}const N=new Map;for(const[e,o]of Object.entries(n.namedColors))N.set(e,o);function namedColor(e){const o=N.get(toLowerCaseAZ(e));return!!o&&{colorNotation:exports.ColorNotation.RGB,channels:[o[0]/255,o[1]/255,o[2]/255],alpha:1,syntaxFlags:new Set([exports.SyntaxFlag.ColorKeyword,exports.SyntaxFlag.NamedColor])}}function normalize_OKLab_ChannelValues(e,o,n){if(a.isTokenIdent(e)&&"none"===toLowerCaseAZ(e[4].value))return n.syntaxFlags.add(exports.SyntaxFlag.HasNoneKeywords),[a.TokenType.Number,"none",e[2],e[3],{value:Number.NaN,type:a.NumberType.Number}];if(a.isTokenPercentage(e)){3!==o&&n.syntaxFlags.add(exports.SyntaxFlag.HasPercentageValues);let t=normalize(e[4].value,100,0,1);return 1===o||2===o?t=normalize(e[4].value,250,-2147483647,2147483647):3===o&&(t=normalize(e[4].value,100,0,1)),[a.TokenType.Number,t.toString(),e[2],e[3],{value:t,type:a.NumberType.Number}]}if(a.isTokenNumber(e)){3!==o&&n.syntaxFlags.add(exports.SyntaxFlag.HasNumberValues);let t=normalize(e[4].value,1,0,1);return 1===o||2===o?t=normalize(e[4].value,1,-2147483647,2147483647):3===o&&(t=normalize(e[4].value,1,0,1)),[a.TokenType.Number,t.toString(),e[2],e[3],{value:t,type:a.NumberType.Number}]}return!1}function oklab(e,o){return threeChannelSpaceSeparated(e,normalize_OKLab_ChannelValues,exports.ColorNotation.OKLab,[],o)}function normalize_OKLCH_ChannelValues(e,o,n){if(a.isTokenIdent(e)&&"none"===toLowerCaseAZ(e[4].value))return n.syntaxFlags.add(exports.SyntaxFlag.HasNoneKeywords),[a.TokenType.Number,"none",e[2],e[3],{value:Number.NaN,type:a.NumberType.Number}];if(2===o){const o=normalizeHue(e);return!1!==o&&(a.isTokenDimension(e)&&n.syntaxFlags.add(exports.SyntaxFlag.HasDimensionValues),o)}if(a.isTokenPercentage(e)){3!==o&&n.syntaxFlags.add(exports.SyntaxFlag.HasPercentageValues);let t=normalize(e[4].value,100,0,1);return 1===o?t=normalize(e[4].value,250,0,2147483647):3===o&&(t=normalize(e[4].value,100,0,1)),[a.TokenType.Number,t.toString(),e[2],e[3],{value:t,type:a.NumberType.Number}]}if(a.isTokenNumber(e)){3!==o&&n.syntaxFlags.add(exports.SyntaxFlag.HasNumberValues);let t=normalize(e[4].value,1,0,1);return 1===o?t=normalize(e[4].value,1,0,2147483647):3===o&&(t=normalize(e[4].value,1,0,1)),[a.TokenType.Number,t.toString(),e[2],e[3],{value:t,type:a.NumberType.Number}]}return!1}function oklch(e,o){return threeChannelSpaceSeparated(e,normalize_OKLCH_ChannelValues,exports.ColorNotation.OKLCH,[],o)}function normalize_legacy_sRGB_ChannelValues(e,o,n){if(a.isTokenPercentage(e)){3===o?n.syntaxFlags.add(exports.SyntaxFlag.HasPercentageAlpha):n.syntaxFlags.add(exports.SyntaxFlag.HasPercentageValues);const t=normalize(e[4].value,100,0,1);return[a.TokenType.Number,t.toString(),e[2],e[3],{value:t,type:a.NumberType.Number}]}if(a.isTokenNumber(e)){3!==o&&n.syntaxFlags.add(exports.SyntaxFlag.HasNumberValues);let t=normalize(e[4].value,255,0,1);return 3===o&&(t=normalize(e[4].value,1,0,1)),[a.TokenType.Number,t.toString(),e[2],e[3],{value:t,type:a.NumberType.Number}]}return!1}function normalize_modern_sRGB_ChannelValues(e,o,n){if(a.isTokenIdent(e)&&"none"===e[4].value.toLowerCase())return n.syntaxFlags.add(exports.SyntaxFlag.HasNoneKeywords),[a.TokenType.Number,"none",e[2],e[3],{value:Number.NaN,type:a.NumberType.Number}];if(a.isTokenPercentage(e)){3!==o&&n.syntaxFlags.add(exports.SyntaxFlag.HasPercentageValues);let t=normalize(e[4].value,100,-2147483647,2147483647);return 3===o&&(t=normalize(e[4].value,100,0,1)),[a.TokenType.Number,t.toString(),e[2],e[3],{value:t,type:a.NumberType.Number}]}if(a.isTokenNumber(e)){3!==o&&n.syntaxFlags.add(exports.SyntaxFlag.HasNumberValues);let t=normalize(e[4].value,255,-2147483647,2147483647);return 3===o&&(t=normalize(e[4].value,1,0,1)),[a.TokenType.Number,t.toString(),e[2],e[3],{value:t,type:a.NumberType.Number}]}return!1}function rgb(e,o){if(e.value.some(e=>t.isTokenNode(e)&&a.isTokenComma(e.value))){const o=rgbCommaSeparated(e);if(!1!==o)return(!o.syntaxFlags.has(exports.SyntaxFlag.HasNumberValues)||!o.syntaxFlags.has(exports.SyntaxFlag.HasPercentageValues))&&o}else{const a=rgbSpaceSeparated(e,o);if(!1!==a)return a}return!1}function rgbCommaSeparated(e){return threeChannelLegacySyntax(e,normalize_legacy_sRGB_ChannelValues,exports.ColorNotation.RGB,[exports.SyntaxFlag.LegacyRGB])}function rgbSpaceSeparated(e,o){return threeChannelSpaceSeparated(e,normalize_modern_sRGB_ChannelValues,exports.ColorNotation.RGB,[],o)}function XYZ_D50_to_sRGB_Gamut(e){const o=n.XYZ_D50_to_sRGB(e);if(n.inGamut(o))return n.clip(o);let a=e;return a=n.XYZ_D50_to_OKLCH(a),a[0]<1e-6&&(a=[0,0,0]),a[0]>.999999&&(a=[1,0,0]),n.gam_sRGB(n.mapGamutRayTrace(a,oklch_to_lin_srgb,lin_srgb_to_oklch))}function oklch_to_lin_srgb(e){return e=n.OKLCH_to_OKLab(e),e=n.OKLab_to_XYZ(e),n.XYZ_to_lin_sRGB(e)}function lin_srgb_to_oklch(e){return e=n.lin_sRGB_to_XYZ(e),e=n.XYZ_to_OKLab(e),n.OKLab_to_OKLCH(e)}function contrastColor(e,o){let a=!1;for(let n=0;n<e.value.length;n++){const r=e.value[n];if(!t.isWhitespaceNode(r)&&!t.isCommentNode(r)&&(a||(a=o(r),!a)))return!1}if(!a)return!1;a.channels=convertNaNToZero(a.channels),a.channels=XYZ_D50_to_sRGB_Gamut(colorData_to_XYZ_D50(a).channels),a.colorNotation=exports.ColorNotation.sRGB;const r={colorNotation:exports.ColorNotation.sRGB,channels:[0,0,0],alpha:1,syntaxFlags:new Set([exports.SyntaxFlag.ContrastColor,exports.SyntaxFlag.Experimental])},l=n.contrast_ratio_wcag_2_1(a.channels,[1,1,1]),s=n.contrast_ratio_wcag_2_1(a.channels,[0,0,0]);return r.channels=l>s?[1,1,1]:[0,0,0],r}function alpha(e,o){let n,l,s=!1,i=!1,u=!1;const c={colorNotation:exports.ColorNotation.sRGB,channels:[0,0,0],alpha:1,syntaxFlags:new Set([])};for(let p=0;p<e.value.length;p++){let N=e.value[p];if(t.isWhitespaceNode(N)||t.isCommentNode(N))for(;t.isWhitespaceNode(e.value[p+1])||t.isCommentNode(e.value[p+1]);)p++;else if(u&&!s&&!i&&t.isTokenNode(N)&&a.isTokenDelim(N.value)&&"/"===N.value[4].value)s=!0;else{if(t.isFunctionNode(N)&&r.mathFunctionNames.has(toLowerCaseAZ(N.getName()))){const[[e]]=r.calcFromComponentValues([[N]],{censorIntoStandardRepresentableValues:!0,globals:l,precision:-1,toCanonicalUnits:!0,rawPercentages:!0});if(!e||!t.isTokenNode(e)||!a.isTokenNumeric(e.value))return!1;Number.isNaN(e.value[4].value)&&(e.value[4].value=0),N=e}if(s||i||!t.isTokenNode(N)||!a.isTokenIdent(N.value)||"from"!==toLowerCaseAZ(N.value[4].value)){if(!s)return!1;if(i)return!1;if(t.isTokenNode(N)){if(a.isTokenIdent(N.value)&&"alpha"===toLowerCaseAZ(N.value[4].value)&&n&&n.has("alpha")){c.alpha=n.get("alpha")[4].value,i=!0;continue}const e=normalize_Color_ChannelValues(N.value,3,c);if(!e||!a.isTokenNumber(e))return!1;c.alpha=new t.TokenNode(e),i=!0;continue}if(t.isFunctionNode(N)){const e=t.replaceComponentValues([[N]],e=>{if(t.isTokenNode(e)&&a.isTokenIdent(e.value)&&"alpha"===toLowerCaseAZ(e.value[4].value)&&n&&n.has("alpha"))return new t.TokenNode(n.get("alpha"))});c.alpha=e[0][0],i=!0;continue}return!1}if(u)return!1;for(;t.isWhitespaceNode(e.value[p+1])||t.isCommentNode(e.value[p+1]);)p++;if(p++,N=e.value[p],u=o(N),!1===u)return!1;n=normalizeRelativeColorDataChannels(u),l=noneToZeroInRelativeColorDataChannels(n),c.syntaxFlags=new Set(u.syntaxFlags),c.syntaxFlags.add(exports.SyntaxFlag.RelativeAlphaSyntax),c.channels=[...u.channels],c.colorNotation=u.colorNotation,c.alpha=u.alpha}}return!!n&&c}function XYZ_D50_to_P3_Gamut(e){const o=n.XYZ_D50_to_P3(e);if(n.inGamut(o))return n.clip(o);let a=e;return a=n.XYZ_D50_to_OKLCH(a),a[0]<1e-6&&(a=[0,0,0]),a[0]>.999999&&(a=[1,0,0]),n.gam_P3(n.mapGamutRayTrace(a,oklch_to_lin_p3,lin_p3_to_oklch))}function oklch_to_lin_p3(e){return e=n.OKLCH_to_OKLab(e),e=n.OKLab_to_XYZ(e),n.XYZ_to_lin_P3(e)}function lin_p3_to_oklch(e){return e=n.lin_P3_to_XYZ(e),e=n.XYZ_to_OKLab(e),n.OKLab_to_OKLCH(e)}function toPrecision(e,o=7){e=+e,o=+o;const a=(Math.floor(Math.abs(e))+"").length;if(o>a)return+e.toFixed(o-a);{const n=10**(a-o);return Math.round(e/n)*n}}function serializeWithAlpha(e,o,n,r){const l=[a.TokenType.CloseParen,")",-1,-1,void 0];if("number"==typeof e.alpha){const s=Math.min(1,Math.max(0,toPrecision(Number.isNaN(e.alpha)?0:e.alpha)));return 1===toPrecision(s,4)?new t.FunctionNode(o,l,r):new t.FunctionNode(o,l,[...r,new t.WhitespaceNode([n]),new t.TokenNode([a.TokenType.Delim,"/",-1,-1,{value:"/"}]),new t.WhitespaceNode([n]),new t.TokenNode([a.TokenType.Number,toPrecision(s,4).toString(),-1,-1,{value:e.alpha,type:a.NumberType.Integer}])])}return new t.FunctionNode(o,l,[...r,new t.WhitespaceNode([n]),new t.TokenNode([a.TokenType.Delim,"/",-1,-1,{value:"/"}]),new t.WhitespaceNode([n]),e.alpha])}exports.color=function color(e){if(t.isFunctionNode(e)){switch(toLowerCaseAZ(e.getName())){case"rgb":case"rgba":return rgb(e,color);case"hsl":case"hsla":return hsl(e,color);case"hwb":return o=color,threeChannelSpaceSeparated(e,normalize_HWB_ChannelValues,exports.ColorNotation.HWB,[],o);case"lab":return lab(e,color);case"lch":return lch(e,color);case"oklab":return oklab(e,color);case"oklch":return oklch(e,color);case"color":return color$1(e,color);case"color-mix":return colorMix(e,color);case"contrast-color":return contrastColor(e,color);case"alpha":return alpha(e,color)}}var o;if(t.isTokenNode(e)){if(a.isTokenHash(e.value))return hex(e.value);if(a.isTokenIdent(e.value)){const o=namedColor(e.value[4].value);return!1!==o?o:"transparent"===toLowerCaseAZ(e.value[4].value)&&{colorNotation:exports.ColorNotation.RGB,channels:[0,0,0],alpha:0,syntaxFlags:new Set([exports.SyntaxFlag.ColorKeyword])}}}return!1},exports.colorDataFitsDisplayP3_Gamut=function colorDataFitsDisplayP3_Gamut(e){const o={...e,channels:[...e.channels]};return o.channels=convertPowerlessComponentsToZeroValuesForDisplay(o.channels,o.colorNotation),!colorDataTo(o,exports.ColorNotation.Display_P3).channels.find(e=>e<-1e-5||e>1.00001)},exports.colorDataFitsRGB_Gamut=function colorDataFitsRGB_Gamut(e){const o={...e,channels:[...e.channels]};return o.channels=convertPowerlessComponentsToZeroValuesForDisplay(o.channels,o.colorNotation),!colorDataTo(o,exports.ColorNotation.RGB).channels.find(e=>e<-1e-5||e>1.00001)},exports.serializeHSL=function serializeHSL(e,o=!0){e.channels=convertPowerlessComponentsToZeroValuesForDisplay(e.channels,e.colorNotation);let r=e.channels.map(e=>Number.isNaN(e)?0:e);r=o?n.XYZ_D50_to_HSL(n.sRGB_to_XYZ_D50(XYZ_D50_to_sRGB_Gamut(colorData_to_XYZ_D50(e).channels))):n.XYZ_D50_to_HSL(colorData_to_XYZ_D50(e).channels),r=r.map(e=>Number.isNaN(e)?0:e);const l=Math.min(360,Math.max(0,Math.round(toPrecision(r[0])))),s=Math.min(100,Math.max(0,Math.round(toPrecision(r[1])))),i=Math.min(100,Math.max(0,Math.round(toPrecision(r[2])))),u=[a.TokenType.CloseParen,")",-1,-1,void 0],c=[a.TokenType.Whitespace," ",-1,-1,void 0],p=[a.TokenType.Comma,",",-1,-1,void 0],N=[new t.TokenNode([a.TokenType.Number,l.toString(),-1,-1,{value:r[0],type:a.NumberType.Integer}]),new t.TokenNode(p),new t.WhitespaceNode([c]),new t.TokenNode([a.TokenType.Percentage,s.toString()+"%",-1,-1,{value:r[1]}]),new t.TokenNode(p),new t.WhitespaceNode([c]),new t.TokenNode([a.TokenType.Percentage,i.toString()+"%",-1,-1,{value:r[2]}])];if("number"==typeof e.alpha){const o=Math.min(1,Math.max(0,toPrecision(Number.isNaN(e.alpha)?0:e.alpha)));return 1===toPrecision(o,4)?new t.FunctionNode([a.TokenType.Function,"hsl(",-1,-1,{value:"hsl"}],u,N):new t.FunctionNode([a.TokenType.Function,"hsla(",-1,-1,{value:"hsla"}],u,[...N,new t.TokenNode(p),new t.WhitespaceNode([c]),new t.TokenNode([a.TokenType.Number,toPrecision(o,4).toString(),-1,-1,{value:e.alpha,type:a.NumberType.Number}])])}return new t.FunctionNode([a.TokenType.Function,"hsla(",-1,-1,{value:"hsla"}],u,[...N,new t.TokenNode(p),new t.WhitespaceNode([c]),e.alpha])},exports.serializeOKLCH=function serializeOKLCH(e){e.channels=convertPowerlessComponentsToZeroValuesForDisplay(e.channels,e.colorNotation);let o=e.channels.map(e=>Number.isNaN(e)?0:e);e.colorNotation!==exports.ColorNotation.OKLCH&&(o=n.XYZ_D50_to_OKLCH(colorData_to_XYZ_D50(e).channels));const r=toPrecision(o[0],6),l=toPrecision(o[1],6),s=toPrecision(o[2],6),i=[a.TokenType.Function,"oklch(",-1,-1,{value:"oklch"}],u=[a.TokenType.Whitespace," ",-1,-1,void 0];return serializeWithAlpha(e,i,u,[new t.TokenNode([a.TokenType.Number,r.toString(),-1,-1,{value:o[0],type:a.NumberType.Number}]),new t.WhitespaceNode([u]),new t.TokenNode([a.TokenType.Number,l.toString(),-1,-1,{value:o[1],type:a.NumberType.Number}]),new t.WhitespaceNode([u]),new t.TokenNode([a.TokenType.Number,s.toString(),-1,-1,{value:o[2],type:a.NumberType.Number}])])},exports.serializeP3=function serializeP3(e,o=!0){e.channels=convertPowerlessComponentsToZeroValuesForDisplay(e.channels,e.colorNotation);let r=e.channels.map(e=>Number.isNaN(e)?0:e);o?r=XYZ_D50_to_P3_Gamut(colorData_to_XYZ_D50(e).channels):e.colorNotation!==exports.ColorNotation.Display_P3&&(r=n.XYZ_D50_to_P3(colorData_to_XYZ_D50(e).channels));const l=o?Math.min(1,Math.max(0,toPrecision(r[0],6))):toPrecision(r[0],6),s=o?Math.min(1,Math.max(0,toPrecision(r[1],6))):toPrecision(r[1],6),i=o?Math.min(1,Math.max(0,toPrecision(r[2],6))):toPrecision(r[2],6),u=[a.TokenType.Function,"color(",-1,-1,{value:"color"}],c=[a.TokenType.Whitespace," ",-1,-1,void 0];return serializeWithAlpha(e,u,c,[new t.TokenNode([a.TokenType.Ident,"display-p3",-1,-1,{value:"display-p3"}]),new t.WhitespaceNode([c]),new t.TokenNode([a.TokenType.Number,l.toString(),-1,-1,{value:r[0],type:a.NumberType.Number}]),new t.WhitespaceNode([c]),new t.TokenNode([a.TokenType.Number,s.toString(),-1,-1,{value:r[1],type:a.NumberType.Number}]),new t.WhitespaceNode([c]),new t.TokenNode([a.TokenType.Number,i.toString(),-1,-1,{value:r[2],type:a.NumberType.Number}])])},exports.serializeRGB=function serializeRGB(e,o=!0){e.channels=convertPowerlessComponentsToZeroValuesForDisplay(e.channels,e.colorNotation);let r=e.channels.map(e=>Number.isNaN(e)?0:e);r=o?XYZ_D50_to_sRGB_Gamut(colorData_to_XYZ_D50(e).channels):n.XYZ_D50_to_sRGB(colorData_to_XYZ_D50(e).channels);const l=Math.min(255,Math.max(0,Math.round(255*toPrecision(r[0])))),s=Math.min(255,Math.max(0,Math.round(255*toPrecision(r[1])))),i=Math.min(255,Math.max(0,Math.round(255*toPrecision(r[2])))),u=[a.TokenType.CloseParen,")",-1,-1,void 0],c=[a.TokenType.Whitespace," ",-1,-1,void 0],p=[a.TokenType.Comma,",",-1,-1,void 0],N=[new t.TokenNode([a.TokenType.Number,l.toString(),-1,-1,{value:Math.min(255,255*Math.max(0,r[0])),type:a.NumberType.Integer}]),new t.TokenNode(p),new t.WhitespaceNode([c]),new t.TokenNode([a.TokenType.Number,s.toString(),-1,-1,{value:Math.min(255,255*Math.max(0,r[1])),type:a.NumberType.Integer}]),new t.TokenNode(p),new t.WhitespaceNode([c]),new t.TokenNode([a.TokenType.Number,i.toString(),-1,-1,{value:Math.min(255,255*Math.max(0,r[2])),type:a.NumberType.Integer}])];if("number"==typeof e.alpha){const o=Math.min(1,Math.max(0,toPrecision(Number.isNaN(e.alpha)?0:e.alpha)));return 1===toPrecision(o,4)?new t.FunctionNode([a.TokenType.Function,"rgb(",-1,-1,{value:"rgb"}],u,N):new t.FunctionNode([a.TokenType.Function,"rgba(",-1,-1,{value:"rgba"}],u,[...N,new t.TokenNode(p),new t.WhitespaceNode([c]),new t.TokenNode([a.TokenType.Number,toPrecision(o,4).toString(),-1,-1,{value:e.alpha,type:a.NumberType.Number}])])}return new t.FunctionNode([a.TokenType.Function,"rgba(",-1,-1,{value:"rgba"}],u,[...N,new t.TokenNode(p),new t.WhitespaceNode([c]),e.alpha])};
+var e,o,a=__nccwpck_require__(68929),n=__nccwpck_require__(11050),t=__nccwpck_require__(85181),r=__nccwpck_require__(13646);function convertNaNToZero(e){return[Number.isNaN(e[0])?0:e[0],Number.isNaN(e[1])?0:e[1],Number.isNaN(e[2])?0:e[2]]}function colorData_to_XYZ_D50(e){switch(e.colorNotation){case exports.ColorNotation.HEX:case exports.ColorNotation.RGB:case exports.ColorNotation.sRGB:return{...e,colorNotation:exports.ColorNotation.XYZ_D50,channels:n.sRGB_to_XYZ_D50(convertNaNToZero(e.channels))};case exports.ColorNotation.Linear_sRGB:return{...e,colorNotation:exports.ColorNotation.XYZ_D50,channels:n.lin_sRGB_to_XYZ_D50(convertNaNToZero(e.channels))};case exports.ColorNotation.Display_P3:return{...e,colorNotation:exports.ColorNotation.XYZ_D50,channels:n.P3_to_XYZ_D50(convertNaNToZero(e.channels))};case exports.ColorNotation.Linear_Display_P3:return{...e,colorNotation:exports.ColorNotation.XYZ_D50,channels:n.lin_P3_to_XYZ_D50(convertNaNToZero(e.channels))};case exports.ColorNotation.Rec2020:return{...e,colorNotation:exports.ColorNotation.XYZ_D50,channels:n.rec_2020_to_XYZ_D50(convertNaNToZero(e.channels))};case exports.ColorNotation.A98_RGB:return{...e,colorNotation:exports.ColorNotation.XYZ_D50,channels:n.a98_RGB_to_XYZ_D50(convertNaNToZero(e.channels))};case exports.ColorNotation.ProPhoto_RGB:return{...e,colorNotation:exports.ColorNotation.XYZ_D50,channels:n.ProPhoto_RGB_to_XYZ_D50(convertNaNToZero(e.channels))};case exports.ColorNotation.HSL:return{...e,colorNotation:exports.ColorNotation.XYZ_D50,channels:n.HSL_to_XYZ_D50(convertNaNToZero(e.channels))};case exports.ColorNotation.HWB:return{...e,colorNotation:exports.ColorNotation.XYZ_D50,channels:n.HWB_to_XYZ_D50(convertNaNToZero(e.channels))};case exports.ColorNotation.Lab:return{...e,colorNotation:exports.ColorNotation.XYZ_D50,channels:n.Lab_to_XYZ_D50(convertNaNToZero(e.channels))};case exports.ColorNotation.OKLab:return{...e,colorNotation:exports.ColorNotation.XYZ_D50,channels:n.OKLab_to_XYZ_D50(convertNaNToZero(e.channels))};case exports.ColorNotation.LCH:return{...e,colorNotation:exports.ColorNotation.XYZ_D50,channels:n.LCH_to_XYZ_D50(convertNaNToZero(e.channels))};case exports.ColorNotation.OKLCH:return{...e,colorNotation:exports.ColorNotation.XYZ_D50,channels:n.OKLCH_to_XYZ_D50(convertNaNToZero(e.channels))};case exports.ColorNotation.XYZ_D50:return{...e,colorNotation:exports.ColorNotation.XYZ_D50,channels:n.XYZ_D50_to_XYZ_D50(convertNaNToZero(e.channels))};case exports.ColorNotation.XYZ_D65:return{...e,colorNotation:exports.ColorNotation.XYZ_D50,channels:n.XYZ_D65_to_XYZ_D50(convertNaNToZero(e.channels))};default:throw new Error("Unsupported color notation")}}exports.ColorNotation=void 0,(e=exports.ColorNotation||(exports.ColorNotation={})).A98_RGB="a98-rgb",e.Display_P3="display-p3",e.Linear_Display_P3="display-p3-linear",e.HEX="hex",e.HSL="hsl",e.HWB="hwb",e.LCH="lch",e.Lab="lab",e.Linear_sRGB="srgb-linear",e.OKLCH="oklch",e.OKLab="oklab",e.ProPhoto_RGB="prophoto-rgb",e.RGB="rgb",e.sRGB="srgb",e.Rec2020="rec2020",e.XYZ_D50="xyz-d50",e.XYZ_D65="xyz-d65",exports.SyntaxFlag=void 0,(o=exports.SyntaxFlag||(exports.SyntaxFlag={})).ColorKeyword="color-keyword",o.HasAlpha="has-alpha",o.HasDimensionValues="has-dimension-values",o.HasNoneKeywords="has-none-keywords",o.HasNumberValues="has-number-values",o.HasPercentageAlpha="has-percentage-alpha",o.HasPercentageValues="has-percentage-values",o.HasVariableAlpha="has-variable-alpha",o.Hex="hex",o.LegacyHSL="legacy-hsl",o.LegacyRGB="legacy-rgb",o.NamedColor="named-color",o.RelativeColorSyntax="relative-color-syntax",o.ColorMix="color-mix",o.ColorMixVariadic="color-mix-variadic",o.ContrastColor="contrast-color",o.RelativeAlphaSyntax="relative-alpha-syntax",o.Experimental="experimental";const l=new Set([exports.ColorNotation.A98_RGB,exports.ColorNotation.Display_P3,exports.ColorNotation.Linear_Display_P3,exports.ColorNotation.HEX,exports.ColorNotation.Linear_sRGB,exports.ColorNotation.ProPhoto_RGB,exports.ColorNotation.RGB,exports.ColorNotation.sRGB,exports.ColorNotation.Rec2020,exports.ColorNotation.XYZ_D50,exports.ColorNotation.XYZ_D65]);function colorDataTo(e,o){const a={...e};if(e.colorNotation!==o){const e=colorData_to_XYZ_D50(a);switch(o){case exports.ColorNotation.HEX:case exports.ColorNotation.RGB:a.colorNotation=exports.ColorNotation.RGB,a.channels=n.XYZ_D50_to_sRGB(e.channels);break;case exports.ColorNotation.sRGB:a.colorNotation=exports.ColorNotation.sRGB,a.channels=n.XYZ_D50_to_sRGB(e.channels);break;case exports.ColorNotation.Linear_sRGB:a.colorNotation=exports.ColorNotation.Linear_sRGB,a.channels=n.XYZ_D50_to_lin_sRGB(e.channels);break;case exports.ColorNotation.Display_P3:a.colorNotation=exports.ColorNotation.Display_P3,a.channels=n.XYZ_D50_to_P3(e.channels);break;case exports.ColorNotation.Linear_Display_P3:a.colorNotation=exports.ColorNotation.Linear_Display_P3,a.channels=n.XYZ_D50_to_lin_P3(e.channels);break;case exports.ColorNotation.Rec2020:a.colorNotation=exports.ColorNotation.Rec2020,a.channels=n.XYZ_D50_to_rec_2020(e.channels);break;case exports.ColorNotation.ProPhoto_RGB:a.colorNotation=exports.ColorNotation.ProPhoto_RGB,a.channels=n.XYZ_D50_to_ProPhoto(e.channels);break;case exports.ColorNotation.A98_RGB:a.colorNotation=exports.ColorNotation.A98_RGB,a.channels=n.XYZ_D50_to_a98_RGB(e.channels);break;case exports.ColorNotation.HSL:a.colorNotation=exports.ColorNotation.HSL,a.channels=n.XYZ_D50_to_HSL(e.channels);break;case exports.ColorNotation.HWB:a.colorNotation=exports.ColorNotation.HWB,a.channels=n.XYZ_D50_to_HWB(e.channels);break;case exports.ColorNotation.Lab:a.colorNotation=exports.ColorNotation.Lab,a.channels=n.XYZ_D50_to_Lab(e.channels);break;case exports.ColorNotation.LCH:a.colorNotation=exports.ColorNotation.LCH,a.channels=n.XYZ_D50_to_LCH(e.channels);break;case exports.ColorNotation.OKLCH:a.colorNotation=exports.ColorNotation.OKLCH,a.channels=n.XYZ_D50_to_OKLCH(e.channels);break;case exports.ColorNotation.OKLab:a.colorNotation=exports.ColorNotation.OKLab,a.channels=n.XYZ_D50_to_OKLab(e.channels);break;case exports.ColorNotation.XYZ_D50:a.colorNotation=exports.ColorNotation.XYZ_D50,a.channels=n.XYZ_D50_to_XYZ_D50(e.channels);break;case exports.ColorNotation.XYZ_D65:a.colorNotation=exports.ColorNotation.XYZ_D65,a.channels=n.XYZ_D50_to_XYZ_D65(e.channels);break;default:throw new Error("Unsupported color notation")}}else a.channels=convertNaNToZero(e.channels);if(o===e.colorNotation)a.channels=carryForwardMissingComponents(e.channels,[0,1,2],a.channels,[0,1,2]);else if(l.has(o)&&l.has(e.colorNotation))a.channels=carryForwardMissingComponents(e.channels,[0,1,2],a.channels,[0,1,2]);else switch(o){case exports.ColorNotation.HSL:switch(e.colorNotation){case exports.ColorNotation.HWB:a.channels=carryForwardMissingComponents(e.channels,[0],a.channels,[0]);break;case exports.ColorNotation.Lab:case exports.ColorNotation.OKLab:a.channels=carryForwardMissingComponents(e.channels,[2],a.channels,[0]);break;case exports.ColorNotation.LCH:case exports.ColorNotation.OKLCH:a.channels=carryForwardMissingComponents(e.channels,[0,1,2],a.channels,[2,1,0])}break;case exports.ColorNotation.HWB:switch(e.colorNotation){case exports.ColorNotation.HSL:a.channels=carryForwardMissingComponents(e.channels,[0],a.channels,[0]);break;case exports.ColorNotation.LCH:case exports.ColorNotation.OKLCH:a.channels=carryForwardMissingComponents(e.channels,[0],a.channels,[2])}break;case exports.ColorNotation.Lab:case exports.ColorNotation.OKLab:switch(e.colorNotation){case exports.ColorNotation.HSL:a.channels=carryForwardMissingComponents(e.channels,[0],a.channels,[2]);break;case exports.ColorNotation.Lab:case exports.ColorNotation.OKLab:a.channels=carryForwardMissingComponents(e.channels,[0,1,2],a.channels,[0,1,2]);break;case exports.ColorNotation.LCH:case exports.ColorNotation.OKLCH:a.channels=carryForwardMissingComponents(e.channels,[0],a.channels,[0])}break;case exports.ColorNotation.LCH:case exports.ColorNotation.OKLCH:switch(e.colorNotation){case exports.ColorNotation.HSL:a.channels=carryForwardMissingComponents(e.channels,[0,1,2],a.channels,[2,1,0]);break;case exports.ColorNotation.HWB:a.channels=carryForwardMissingComponents(e.channels,[0],a.channels,[2]);break;case exports.ColorNotation.Lab:case exports.ColorNotation.OKLab:a.channels=carryForwardMissingComponents(e.channels,[0],a.channels,[0]);break;case exports.ColorNotation.LCH:case exports.ColorNotation.OKLCH:a.channels=carryForwardMissingComponents(e.channels,[0,1,2],a.channels,[0,1,2])}}return a.channels=convertPowerlessComponentsToMissingComponents(a.channels,o),a}function convertPowerlessComponentsToMissingComponents(e,o){const a=[...e];switch(o){case exports.ColorNotation.HSL:!Number.isNaN(a[1])&&reducePrecision(a[1],4)<=0&&(a[0]=Number.NaN);break;case exports.ColorNotation.HWB:Math.max(0,reducePrecision(a[1],4))+Math.max(0,reducePrecision(a[2],4))>=100&&(a[0]=Number.NaN);break;case exports.ColorNotation.LCH:!Number.isNaN(a[1])&&reducePrecision(a[1],4)<=0&&(a[2]=Number.NaN);break;case exports.ColorNotation.OKLCH:!Number.isNaN(a[1])&&reducePrecision(a[1],6)<=0&&(a[2]=Number.NaN)}return a}function convertPowerlessComponentsToZeroValuesForDisplay(e,o){const a=[...e];switch(o){case exports.ColorNotation.HSL:(reducePrecision(a[2])<=0||reducePrecision(a[2])>=100)&&(a[0]=Number.NaN,a[1]=Number.NaN),reducePrecision(a[1])<=0&&(a[0]=Number.NaN);break;case exports.ColorNotation.HWB:Math.max(0,reducePrecision(a[1]))+Math.max(0,reducePrecision(a[2]))>=100&&(a[0]=Number.NaN);break;case exports.ColorNotation.Lab:(reducePrecision(a[0])<=0||reducePrecision(a[0])>=100)&&(a[1]=Number.NaN,a[2]=Number.NaN);break;case exports.ColorNotation.LCH:reducePrecision(a[1])<=0&&(a[2]=Number.NaN),(reducePrecision(a[0])<=0||reducePrecision(a[0])>=100)&&(a[1]=Number.NaN,a[2]=Number.NaN);break;case exports.ColorNotation.OKLab:(reducePrecision(a[0])<=0||reducePrecision(a[0])>=1)&&(a[1]=Number.NaN,a[2]=Number.NaN);break;case exports.ColorNotation.OKLCH:reducePrecision(a[1])<=0&&(a[2]=Number.NaN),(reducePrecision(a[0])<=0||reducePrecision(a[0])>=1)&&(a[1]=Number.NaN,a[2]=Number.NaN)}return a}function carryForwardMissingComponents(e,o,a,n){const t=[...a];for(const a of o)Number.isNaN(e[o[a]])&&(t[n[a]]=Number.NaN);return t}function normalizeRelativeColorDataChannels(e){const o=new Map;switch(e.colorNotation){case exports.ColorNotation.RGB:case exports.ColorNotation.HEX:o.set("r",dummyNumberToken(255*e.channels[0])),o.set("g",dummyNumberToken(255*e.channels[1])),o.set("b",dummyNumberToken(255*e.channels[2])),"number"==typeof e.alpha&&o.set("alpha",dummyNumberToken(e.alpha));break;case exports.ColorNotation.HSL:o.set("h",dummyNumberToken(e.channels[0])),o.set("s",dummyNumberToken(e.channels[1])),o.set("l",dummyNumberToken(e.channels[2])),"number"==typeof e.alpha&&o.set("alpha",dummyNumberToken(e.alpha));break;case exports.ColorNotation.HWB:o.set("h",dummyNumberToken(e.channels[0])),o.set("w",dummyNumberToken(e.channels[1])),o.set("b",dummyNumberToken(e.channels[2])),"number"==typeof e.alpha&&o.set("alpha",dummyNumberToken(e.alpha));break;case exports.ColorNotation.Lab:case exports.ColorNotation.OKLab:o.set("l",dummyNumberToken(e.channels[0])),o.set("a",dummyNumberToken(e.channels[1])),o.set("b",dummyNumberToken(e.channels[2])),"number"==typeof e.alpha&&o.set("alpha",dummyNumberToken(e.alpha));break;case exports.ColorNotation.LCH:case exports.ColorNotation.OKLCH:o.set("l",dummyNumberToken(e.channels[0])),o.set("c",dummyNumberToken(e.channels[1])),o.set("h",dummyNumberToken(e.channels[2])),"number"==typeof e.alpha&&o.set("alpha",dummyNumberToken(e.alpha));break;case exports.ColorNotation.sRGB:case exports.ColorNotation.A98_RGB:case exports.ColorNotation.Display_P3:case exports.ColorNotation.Linear_Display_P3:case exports.ColorNotation.Rec2020:case exports.ColorNotation.Linear_sRGB:case exports.ColorNotation.ProPhoto_RGB:o.set("r",dummyNumberToken(e.channels[0])),o.set("g",dummyNumberToken(e.channels[1])),o.set("b",dummyNumberToken(e.channels[2])),"number"==typeof e.alpha&&o.set("alpha",dummyNumberToken(e.alpha));break;case exports.ColorNotation.XYZ_D50:case exports.ColorNotation.XYZ_D65:o.set("x",dummyNumberToken(e.channels[0])),o.set("y",dummyNumberToken(e.channels[1])),o.set("z",dummyNumberToken(e.channels[2])),"number"==typeof e.alpha&&o.set("alpha",dummyNumberToken(e.alpha))}return o}function noneToZeroInRelativeColorDataChannels(e){const o=new Map(e);for(const[a,n]of e)Number.isNaN(n[4].value)&&o.set(a,dummyNumberToken(0));return o}function dummyNumberToken(e){return Number.isNaN(e)?[a.TokenType.Number,"none",-1,-1,{value:Number.NaN,type:a.NumberType.Number}]:[a.TokenType.Number,e.toString(),-1,-1,{value:e,type:a.NumberType.Number}]}function reducePrecision(e,o=7){if(Number.isNaN(e))return 0;const a=Math.pow(10,o);return Math.round(e*a)/a}function normalize(e,o,a,n){return Math.min(Math.max(e/o,a),n)}const s=/[A-Z]/g;function toLowerCaseAZ(e){return e.replace(s,e=>String.fromCharCode(e.charCodeAt(0)+32))}function normalize_Color_ChannelValues(e,o,n){if(a.isTokenIdent(e)&&"none"===toLowerCaseAZ(e[4].value))return n.syntaxFlags.add(exports.SyntaxFlag.HasNoneKeywords),[a.TokenType.Number,"none",e[2],e[3],{value:Number.NaN,type:a.NumberType.Number}];if(a.isTokenPercentage(e)){3!==o&&n.syntaxFlags.add(exports.SyntaxFlag.HasPercentageValues);let t=normalize(e[4].value,100,-2147483647,2147483647);return 3===o&&(t=normalize(e[4].value,100,0,1)),[a.TokenType.Number,t.toString(),e[2],e[3],{value:t,type:a.NumberType.Number}]}if(a.isTokenNumber(e)){3!==o&&n.syntaxFlags.add(exports.SyntaxFlag.HasNumberValues);let t=normalize(e[4].value,1,-2147483647,2147483647);return 3===o&&(t=normalize(e[4].value,1,0,1)),[a.TokenType.Number,t.toString(),e[2],e[3],{value:t,type:a.NumberType.Number}]}return!1}const i=new Set(["srgb","srgb-linear","display-p3","display-p3-linear","a98-rgb","prophoto-rgb","rec2020","xyz","xyz-d50","xyz-d65"]);function color$1(e,o){const n=[],l=[],s=[],u=[];let c,p,N=!1,m=!1;const h={colorNotation:exports.ColorNotation.sRGB,channels:[0,0,0],alpha:1,syntaxFlags:new Set([])};let x=n;for(let y=0;y<e.value.length;y++){let b=e.value[y];if(t.isWhitespaceNode(b)||t.isCommentNode(b))for(;t.isWhitespaceNode(e.value[y+1])||t.isCommentNode(e.value[y+1]);)y++;else if(x===n&&n.length&&(x=l),x===l&&l.length&&(x=s),t.isTokenNode(b)&&a.isTokenDelim(b.value)&&"/"===b.value[4].value){if(x===u)return!1;x=u}else{if(t.isFunctionNode(b)){if(x===u&&"var"===toLowerCaseAZ(b.getName())){h.syntaxFlags.add(exports.SyntaxFlag.HasVariableAlpha),x.push(b);continue}if(!r.mathFunctionNames.has(toLowerCaseAZ(b.getName())))return!1;const[[e]]=r.calcFromComponentValues([[b]],{censorIntoStandardRepresentableValues:!0,globals:p,precision:-1,toCanonicalUnits:!0,rawPercentages:!0});if(!e||!t.isTokenNode(e)||!a.isTokenNumeric(e.value))return!1;Number.isNaN(e.value[4].value)&&(e.value[4].value=0),b=e}if(x===n&&0===n.length&&t.isTokenNode(b)&&a.isTokenIdent(b.value)&&i.has(toLowerCaseAZ(b.value[4].value))){if(N)return!1;N=toLowerCaseAZ(b.value[4].value),h.colorNotation=colorSpaceNameToColorNotation(N),m&&(m.colorNotation!==h.colorNotation&&(m=colorDataTo(m,h.colorNotation)),c=normalizeRelativeColorDataChannels(m),p=noneToZeroInRelativeColorDataChannels(c))}else if(x===n&&0===n.length&&t.isTokenNode(b)&&a.isTokenIdent(b.value)&&"from"===toLowerCaseAZ(b.value[4].value)){if(m)return!1;if(N)return!1;for(;t.isWhitespaceNode(e.value[y+1])||t.isCommentNode(e.value[y+1]);)y++;if(y++,b=e.value[y],m=o(b),!1===m)return!1;m.syntaxFlags.has(exports.SyntaxFlag.Experimental)&&h.syntaxFlags.add(exports.SyntaxFlag.Experimental),h.syntaxFlags.add(exports.SyntaxFlag.RelativeColorSyntax)}else{if(!t.isTokenNode(b))return!1;if(a.isTokenIdent(b.value)&&c&&c.has(toLowerCaseAZ(b.value[4].value))){x.push(new t.TokenNode(c.get(toLowerCaseAZ(b.value[4].value))));continue}x.push(b)}}}if(!N)return!1;if(1!==x.length)return!1;if(1!==n.length||1!==l.length||1!==s.length)return!1;if(!t.isTokenNode(n[0])||!t.isTokenNode(l[0])||!t.isTokenNode(s[0]))return!1;if(c&&!c.has("alpha"))return!1;const y=normalize_Color_ChannelValues(n[0].value,0,h);if(!y||!a.isTokenNumber(y))return!1;const b=normalize_Color_ChannelValues(l[0].value,1,h);if(!b||!a.isTokenNumber(b))return!1;const C=normalize_Color_ChannelValues(s[0].value,2,h);if(!C||!a.isTokenNumber(C))return!1;const d=[y,b,C];if(1===u.length)if(h.syntaxFlags.add(exports.SyntaxFlag.HasAlpha),t.isTokenNode(u[0])){const e=normalize_Color_ChannelValues(u[0].value,3,h);if(!e||!a.isTokenNumber(e))return!1;d.push(e)}else h.alpha=u[0];else if(c&&c.has("alpha")){const e=normalize_Color_ChannelValues(c.get("alpha"),3,h);if(!e||!a.isTokenNumber(e))return!1;d.push(e)}return h.channels=[d[0][4].value,d[1][4].value,d[2][4].value],4===d.length&&(h.alpha=d[3][4].value),h}function colorSpaceNameToColorNotation(e){switch(e){case"srgb":return exports.ColorNotation.sRGB;case"srgb-linear":return exports.ColorNotation.Linear_sRGB;case"display-p3":return exports.ColorNotation.Display_P3;case"display-p3-linear":return exports.ColorNotation.Linear_Display_P3;case"a98-rgb":return exports.ColorNotation.A98_RGB;case"prophoto-rgb":return exports.ColorNotation.ProPhoto_RGB;case"rec2020":return exports.ColorNotation.Rec2020;case"xyz":case"xyz-d65":return exports.ColorNotation.XYZ_D65;case"xyz-d50":return exports.ColorNotation.XYZ_D50;default:throw new Error("Unknown color space name: "+e)}}const u=new Set(["srgb","srgb-linear","display-p3","display-p3-linear","a98-rgb","prophoto-rgb","rec2020","lab","oklab","xyz","xyz-d50","xyz-d65"]),c=new Set(["hsl","hwb","lch","oklch"]),p=new Set(["shorter","longer","increasing","decreasing"]);function colorMix(e,o){let n=null,r=null,l=null,s=!1;for(let i=0;i<e.value.length;i++){const N=e.value[i];if(!t.isWhiteSpaceOrCommentNode(N)){if(!(n||t.isTokenNode(N)&&a.isTokenIdent(N.value)&&"in"===toLowerCaseAZ(N.value[4].value)))return colorMixRectangular("oklab",colorMixComponents(e.value,o));if(t.isTokenNode(N)&&a.isTokenIdent(N.value)){if(!n&&"in"===toLowerCaseAZ(N.value[4].value)){n=N;continue}if(n&&!r){r=toLowerCaseAZ(N.value[4].value);continue}if(n&&r&&!l&&c.has(r)){l=toLowerCaseAZ(N.value[4].value);continue}if(n&&r&&l&&!s&&"hue"===toLowerCaseAZ(N.value[4].value)){s=!0;continue}return!1}return!(!t.isTokenNode(N)||!a.isTokenComma(N.value))&&(!!r&&(l||s?!!(r&&l&&s&&c.has(r)&&p.has(l))&&colorMixPolar(r,l,colorMixComponents(e.value.slice(i+1),o)):u.has(r)?colorMixRectangular(r,colorMixComponents(e.value.slice(i+1),o)):!!c.has(r)&&colorMixPolar(r,"shorter",colorMixComponents(e.value.slice(i+1),o))))}}return!1}function colorMixComponents(e,o){const n=[];let l=1,s=!1,i=!1;for(let l=0;l<e.length;l++){let u=e[l];if(!t.isWhiteSpaceOrCommentNode(u)){if(!t.isTokenNode(u)||!a.isTokenComma(u.value)){if(!s){const e=o(u);if(e){s=e;continue}}if(!i){if(t.isFunctionNode(u)&&r.mathFunctionNames.has(toLowerCaseAZ(u.getName()))){if([[u]]=r.calcFromComponentValues([[u]],{censorIntoStandardRepresentableValues:!0,precision:-1,toCanonicalUnits:!0,rawPercentages:!0}),!u||!t.isTokenNode(u)||!a.isTokenNumeric(u.value))return!1;Number.isNaN(u.value[4].value)&&(u.value[4].value=0)}if(t.isTokenNode(u)&&a.isTokenPercentage(u.value)&&u.value[4].value>=0){i=u.value[4].value;continue}}return!1}if(!s)return!1;n.push({color:s,percentage:i}),s=!1,i=!1}}if(!s)return!1;n.push({color:s,percentage:i});let u=0,c=0;for(let e=0;e<n.length;e++){const o=n[e].percentage;if(!1!==o){if(o<0||o>100)return!1;u+=o}else c++}const p=Math.max(0,100-u);u=0;for(let e=0;e<n.length;e++)!1===n[e].percentage&&(n[e].percentage=p/c),u+=n[e].percentage;if(0===u)return{colors:[{color:{channels:[0,0,0],colorNotation:exports.ColorNotation.sRGB,alpha:0,syntaxFlags:new Set},percentage:0}],alphaMultiplier:0};if(u>100)for(let e=0;e<n.length;e++){let o=n[e].percentage;o=o/u*100,n[e].percentage=o}if(u<100){l=u/100;for(let e=0;e<n.length;e++){let o=n[e].percentage;o=o/u*100,n[e].percentage=o}}return{colors:n,alphaMultiplier:l}}function colorMixRectangular(e,o){if(!o||!o.colors.length)return!1;const a=o.colors.slice();a.reverse();let n=exports.ColorNotation.RGB;switch(e){case"srgb":n=exports.ColorNotation.RGB;break;case"srgb-linear":n=exports.ColorNotation.Linear_sRGB;break;case"display-p3":n=exports.ColorNotation.Display_P3;break;case"display-p3-linear":n=exports.ColorNotation.Linear_Display_P3;break;case"a98-rgb":n=exports.ColorNotation.A98_RGB;break;case"prophoto-rgb":n=exports.ColorNotation.ProPhoto_RGB;break;case"rec2020":n=exports.ColorNotation.Rec2020;break;case"lab":n=exports.ColorNotation.Lab;break;case"oklab":n=exports.ColorNotation.OKLab;break;case"xyz-d50":n=exports.ColorNotation.XYZ_D50;break;case"xyz":case"xyz-d65":n=exports.ColorNotation.XYZ_D65;break;default:return!1}if(1===a.length){const e=colorDataTo(a[0].color,n);return e.colorNotation=n,e.syntaxFlags.add(exports.SyntaxFlag.ColorMixVariadic),"number"!=typeof e.alpha?!1:(e.alpha=e.alpha*o.alphaMultiplier,e)}for(;a.length>=2;){const e=a.pop(),o=a.pop();if(!e||!o)return!1;const t=colorMixRectangularPair(n,e.color,e.percentage,o.color,o.percentage);if(!t)return!1;a.push({color:t,percentage:e.percentage+o.percentage})}const t=a[0]?.color;return!!t&&(o.colors.some(e=>e.color.syntaxFlags.has(exports.SyntaxFlag.Experimental))&&t.syntaxFlags.add(exports.SyntaxFlag.Experimental),"number"==typeof t.alpha&&(t.alpha=t.alpha*o.alphaMultiplier,2!==o.colors.length&&t.syntaxFlags.add(exports.SyntaxFlag.ColorMixVariadic),t))}function colorMixRectangularPair(e,o,a,n,t){const r=a/(a+t);let l=o.alpha;if("number"!=typeof l)return!1;let s=n.alpha;if("number"!=typeof s)return!1;l=Number.isNaN(l)?s:l,s=Number.isNaN(s)?l:s;const i=colorDataTo(o,e).channels,u=colorDataTo(n,e).channels;i[0]=fillInMissingComponent(i[0],u[0]),u[0]=fillInMissingComponent(u[0],i[0]),i[1]=fillInMissingComponent(i[1],u[1]),u[1]=fillInMissingComponent(u[1],i[1]),i[2]=fillInMissingComponent(i[2],u[2]),u[2]=fillInMissingComponent(u[2],i[2]),i[0]=premultiply(i[0],l),i[1]=premultiply(i[1],l),i[2]=premultiply(i[2],l),u[0]=premultiply(u[0],s),u[1]=premultiply(u[1],s),u[2]=premultiply(u[2],s);const c=interpolate(l,s,r);return{colorNotation:e,channels:[un_premultiply(interpolate(i[0],u[0],r),c),un_premultiply(interpolate(i[1],u[1],r),c),un_premultiply(interpolate(i[2],u[2],r),c)],alpha:c,syntaxFlags:new Set([exports.SyntaxFlag.ColorMix])}}function colorMixPolar(e,o,a){if(!a||!a.colors.length)return!1;const n=a.colors.slice();n.reverse();let t=exports.ColorNotation.HSL;switch(e){case"hsl":t=exports.ColorNotation.HSL;break;case"hwb":t=exports.ColorNotation.HWB;break;case"lch":t=exports.ColorNotation.LCH;break;case"oklch":t=exports.ColorNotation.OKLCH;break;default:return!1}if(1===n.length){const e=colorDataTo(n[0].color,t);return e.colorNotation=t,e.syntaxFlags.add(exports.SyntaxFlag.ColorMixVariadic),"number"!=typeof e.alpha?!1:(e.alpha=e.alpha*a.alphaMultiplier,e)}for(;n.length>=2;){const e=n.pop(),a=n.pop();if(!e||!a)return!1;const r=colorMixPolarPair(t,o,e.color,e.percentage,a.color,a.percentage);if(!r)return!1;n.push({color:r,percentage:e.percentage+a.percentage})}const r=n[0]?.color;return!!r&&(a.colors.some(e=>e.color.syntaxFlags.has(exports.SyntaxFlag.Experimental))&&r.syntaxFlags.add(exports.SyntaxFlag.Experimental),"number"==typeof r.alpha&&(r.alpha=r.alpha*a.alphaMultiplier,2!==a.colors.length&&r.syntaxFlags.add(exports.SyntaxFlag.ColorMixVariadic),r))}function colorMixPolarPair(e,o,a,n,t,r){const l=n/(n+r);let s=0,i=0,u=0,c=0,p=0,N=0,m=a.alpha;if("number"!=typeof m)return!1;let h=t.alpha;if("number"!=typeof h)return!1;m=Number.isNaN(m)?h:m,h=Number.isNaN(h)?m:h;const x=colorDataTo(a,e).channels,y=colorDataTo(t,e).channels;switch(e){case exports.ColorNotation.HSL:case exports.ColorNotation.HWB:s=x[0],i=y[0],u=x[1],c=y[1],p=x[2],N=y[2];break;case exports.ColorNotation.LCH:case exports.ColorNotation.OKLCH:u=x[0],c=y[0],p=x[1],N=y[1],s=x[2],i=y[2]}s=fillInMissingComponent(s,i),Number.isNaN(s)&&(s=0),i=fillInMissingComponent(i,s),Number.isNaN(i)&&(i=0),u=fillInMissingComponent(u,c),c=fillInMissingComponent(c,u),p=fillInMissingComponent(p,N),N=fillInMissingComponent(N,p);const b=i-s;switch(o){case"shorter":b>180?s+=360:b<-180&&(i+=360);break;case"longer":-180<b&&b<180&&(b>0?s+=360:i+=360);break;case"increasing":b<0&&(i+=360);break;case"decreasing":b>0&&(s+=360);break;default:throw new Error("Unknown hue interpolation method")}u=premultiply(u,m),p=premultiply(p,m),c=premultiply(c,h),N=premultiply(N,h);let C=[0,0,0];const d=interpolate(m,h,l);switch(e){case exports.ColorNotation.HSL:case exports.ColorNotation.HWB:C=[interpolate(s,i,l),un_premultiply(interpolate(u,c,l),d),un_premultiply(interpolate(p,N,l),d)];break;case exports.ColorNotation.LCH:case exports.ColorNotation.OKLCH:C=[un_premultiply(interpolate(u,c,l),d),un_premultiply(interpolate(p,N,l),d),interpolate(s,i,l)]}return{colorNotation:e,channels:C,alpha:d,syntaxFlags:new Set([exports.SyntaxFlag.ColorMix])}}function fillInMissingComponent(e,o){return Number.isNaN(e)?o:e}function interpolate(e,o,a){return e*a+o*(1-a)}function premultiply(e,o){return Number.isNaN(o)?e:Number.isNaN(e)?Number.NaN:e*o}function un_premultiply(e,o){return 0===o||Number.isNaN(o)?e:Number.isNaN(e)?Number.NaN:e/o}function hex(e){const o=toLowerCaseAZ(e[4].value);if(o.match(/[^a-f0-9]/))return!1;const a={colorNotation:exports.ColorNotation.HEX,channels:[0,0,0],alpha:1,syntaxFlags:new Set([exports.SyntaxFlag.Hex])},n=o.length;if(3===n){const e=o[0],n=o[1],t=o[2];return a.channels=[parseInt(e+e,16)/255,parseInt(n+n,16)/255,parseInt(t+t,16)/255],a}if(6===n){const e=o[0]+o[1],n=o[2]+o[3],t=o[4]+o[5];return a.channels=[parseInt(e,16)/255,parseInt(n,16)/255,parseInt(t,16)/255],a}if(4===n){const e=o[0],n=o[1],t=o[2],r=o[3];return a.channels=[parseInt(e+e,16)/255,parseInt(n+n,16)/255,parseInt(t+t,16)/255],a.alpha=parseInt(r+r,16)/255,a.syntaxFlags.add(exports.SyntaxFlag.HasAlpha),a}if(8===n){const e=o[0]+o[1],n=o[2]+o[3],t=o[4]+o[5],r=o[6]+o[7];return a.channels=[parseInt(e,16)/255,parseInt(n,16)/255,parseInt(t,16)/255],a.alpha=parseInt(r,16)/255,a.syntaxFlags.add(exports.SyntaxFlag.HasAlpha),a}return!1}function normalizeHue(e){if(a.isTokenNumber(e))return e[4].value=e[4].value%360,e[1]=e[4].value.toString(),e;if(a.isTokenDimension(e)){let o=e[4].value;switch(toLowerCaseAZ(e[4].unit)){case"deg":break;case"rad":o=180*e[4].value/Math.PI;break;case"grad":o=.9*e[4].value;break;case"turn":o=360*e[4].value;break;default:return!1}return o%=360,[a.TokenType.Number,o.toString(),e[2],e[3],{value:o,type:a.NumberType.Number}]}return!1}function normalize_legacy_HSL_ChannelValues(e,o,n){if(0===o){const o=normalizeHue(e);return!1!==o&&(a.isTokenDimension(e)&&n.syntaxFlags.add(exports.SyntaxFlag.HasDimensionValues),o)}if(a.isTokenPercentage(e)){3===o?n.syntaxFlags.add(exports.SyntaxFlag.HasPercentageAlpha):n.syntaxFlags.add(exports.SyntaxFlag.HasPercentageValues);let t=normalize(e[4].value,1,0,100);return 3===o&&(t=normalize(e[4].value,100,0,1)),[a.TokenType.Number,t.toString(),e[2],e[3],{value:t,type:a.NumberType.Number}]}if(a.isTokenNumber(e)){if(3!==o)return!1;let n=normalize(e[4].value,1,0,100);return 3===o&&(n=normalize(e[4].value,1,0,1)),[a.TokenType.Number,n.toString(),e[2],e[3],{value:n,type:a.NumberType.Number}]}return!1}function normalize_modern_HSL_ChannelValues(e,o,n){if(a.isTokenIdent(e)&&"none"===toLowerCaseAZ(e[4].value))return n.syntaxFlags.add(exports.SyntaxFlag.HasNoneKeywords),[a.TokenType.Number,"none",e[2],e[3],{value:Number.NaN,type:a.NumberType.Number}];if(0===o){const o=normalizeHue(e);return!1!==o&&(a.isTokenDimension(e)&&n.syntaxFlags.add(exports.SyntaxFlag.HasDimensionValues),o)}if(a.isTokenPercentage(e)){3===o?n.syntaxFlags.add(exports.SyntaxFlag.HasPercentageAlpha):n.syntaxFlags.add(exports.SyntaxFlag.HasPercentageValues);let t=e[4].value;return 3===o?t=normalize(e[4].value,100,0,1):1===o&&(t=normalize(e[4].value,1,0,2147483647)),[a.TokenType.Number,t.toString(),e[2],e[3],{value:t,type:a.NumberType.Number}]}if(a.isTokenNumber(e)){3!==o&&n.syntaxFlags.add(exports.SyntaxFlag.HasNumberValues);let t=e[4].value;return 3===o?t=normalize(e[4].value,1,0,1):1===o&&(t=normalize(e[4].value,1,0,2147483647)),[a.TokenType.Number,t.toString(),e[2],e[3],{value:t,type:a.NumberType.Number}]}return!1}function threeChannelLegacySyntax(e,o,n,l){const s=[],i=[],u=[],c=[],p={colorNotation:n,channels:[0,0,0],alpha:1,syntaxFlags:new Set(l)};let N=s;for(let o=0;o<e.value.length;o++){let n=e.value[o];if(!t.isWhitespaceNode(n)&&!t.isCommentNode(n)){if(t.isTokenNode(n)&&a.isTokenComma(n.value)){if(N===s){N=i;continue}if(N===i){N=u;continue}if(N===u){N=c;continue}if(N===c)return!1}if(t.isFunctionNode(n)){if(N===c&&"var"===n.getName().toLowerCase()){p.syntaxFlags.add(exports.SyntaxFlag.HasVariableAlpha),N.push(n);continue}if(!r.mathFunctionNames.has(n.getName().toLowerCase()))return!1;const[[e]]=r.calcFromComponentValues([[n]],{censorIntoStandardRepresentableValues:!0,precision:-1,toCanonicalUnits:!0,rawPercentages:!0});if(!e||!t.isTokenNode(e)||!a.isTokenNumeric(e.value))return!1;Number.isNaN(e.value[4].value)&&(e.value[4].value=0),n=e}if(!t.isTokenNode(n))return!1;N.push(n)}}if(1!==N.length)return!1;if(1!==s.length||1!==i.length||1!==u.length)return!1;if(!t.isTokenNode(s[0])||!t.isTokenNode(i[0])||!t.isTokenNode(u[0]))return!1;const m=o(s[0].value,0,p);if(!m||!a.isTokenNumber(m))return!1;const h=o(i[0].value,1,p);if(!h||!a.isTokenNumber(h))return!1;const x=o(u[0].value,2,p);if(!x||!a.isTokenNumber(x))return!1;const y=[m,h,x];if(1===c.length)if(p.syntaxFlags.add(exports.SyntaxFlag.HasAlpha),t.isTokenNode(c[0])){const e=o(c[0].value,3,p);if(!e||!a.isTokenNumber(e))return!1;y.push(e)}else p.alpha=c[0];return p.channels=[y[0][4].value,y[1][4].value,y[2][4].value],4===y.length&&(p.alpha=y[3][4].value),p}function threeChannelSpaceSeparated(e,o,n,l,s){const i=[],u=[],c=[],p=[];let N,m,h=!1;const x={colorNotation:n,channels:[0,0,0],alpha:1,syntaxFlags:new Set(l)};let y=i;for(let o=0;o<e.value.length;o++){let l=e.value[o];if(t.isWhitespaceNode(l)||t.isCommentNode(l))for(;t.isWhitespaceNode(e.value[o+1])||t.isCommentNode(e.value[o+1]);)o++;else if(y===i&&i.length&&(y=u),y===u&&u.length&&(y=c),t.isTokenNode(l)&&a.isTokenDelim(l.value)&&"/"===l.value[4].value){if(y===p)return!1;y=p}else{if(t.isFunctionNode(l)){if(y===p&&"var"===l.getName().toLowerCase()){x.syntaxFlags.add(exports.SyntaxFlag.HasVariableAlpha),y.push(l);continue}if(!r.mathFunctionNames.has(l.getName().toLowerCase()))return!1;const[[e]]=r.calcFromComponentValues([[l]],{censorIntoStandardRepresentableValues:!0,globals:m,precision:-1,toCanonicalUnits:!0,rawPercentages:!0});if(!e||!t.isTokenNode(e)||!a.isTokenNumeric(e.value))return!1;Number.isNaN(e.value[4].value)&&(e.value[4].value=0),l=e}if(y===i&&0===i.length&&t.isTokenNode(l)&&a.isTokenIdent(l.value)&&"from"===l.value[4].value.toLowerCase()){if(h)return!1;for(;t.isWhitespaceNode(e.value[o+1])||t.isCommentNode(e.value[o+1]);)o++;if(o++,l=e.value[o],h=s(l),!1===h)return!1;h.syntaxFlags.has(exports.SyntaxFlag.Experimental)&&x.syntaxFlags.add(exports.SyntaxFlag.Experimental),x.syntaxFlags.add(exports.SyntaxFlag.RelativeColorSyntax),h.colorNotation!==n&&(h=colorDataTo(h,n)),N=normalizeRelativeColorDataChannels(h),m=noneToZeroInRelativeColorDataChannels(N)}else{if(!t.isTokenNode(l))return!1;if(a.isTokenIdent(l.value)&&N){const e=l.value[4].value.toLowerCase();if(N.has(e)){y.push(new t.TokenNode(N.get(e)));continue}}y.push(l)}}}if(1!==y.length)return!1;if(1!==i.length||1!==u.length||1!==c.length)return!1;if(!t.isTokenNode(i[0])||!t.isTokenNode(u[0])||!t.isTokenNode(c[0]))return!1;if(N&&!N.has("alpha"))return!1;const b=o(i[0].value,0,x);if(!b||!a.isTokenNumber(b))return!1;const C=o(u[0].value,1,x);if(!C||!a.isTokenNumber(C))return!1;const d=o(c[0].value,2,x);if(!d||!a.isTokenNumber(d))return!1;const g=[b,C,d];if(1===p.length)if(x.syntaxFlags.add(exports.SyntaxFlag.HasAlpha),t.isTokenNode(p[0])){const e=o(p[0].value,3,x);if(!e||!a.isTokenNumber(e))return!1;g.push(e)}else x.alpha=p[0];else if(N&&N.has("alpha")){const e=o(N.get("alpha"),3,x);if(!e||!a.isTokenNumber(e))return!1;g.push(e)}return x.channels=[g[0][4].value,g[1][4].value,g[2][4].value],4===g.length&&(x.alpha=g[3][4].value),x}function hsl(e,o){if(e.value.some(e=>t.isTokenNode(e)&&a.isTokenComma(e.value))){const o=hslCommaSeparated(e);if(!1!==o)return o}{const a=hslSpaceSeparated(e,o);if(!1!==a)return a}return!1}function hslCommaSeparated(e){return threeChannelLegacySyntax(e,normalize_legacy_HSL_ChannelValues,exports.ColorNotation.HSL,[exports.SyntaxFlag.LegacyHSL])}function hslSpaceSeparated(e,o){return threeChannelSpaceSeparated(e,normalize_modern_HSL_ChannelValues,exports.ColorNotation.HSL,[],o)}function normalize_HWB_ChannelValues(e,o,n){if(a.isTokenIdent(e)&&"none"===toLowerCaseAZ(e[4].value))return n.syntaxFlags.add(exports.SyntaxFlag.HasNoneKeywords),[a.TokenType.Number,"none",e[2],e[3],{value:Number.NaN,type:a.NumberType.Number}];if(0===o){const o=normalizeHue(e);return!1!==o&&(a.isTokenDimension(e)&&n.syntaxFlags.add(exports.SyntaxFlag.HasDimensionValues),o)}if(a.isTokenPercentage(e)){3===o?n.syntaxFlags.add(exports.SyntaxFlag.HasPercentageAlpha):n.syntaxFlags.add(exports.SyntaxFlag.HasPercentageValues);let t=e[4].value;return 3===o&&(t=normalize(e[4].value,100,0,1)),[a.TokenType.Number,t.toString(),e[2],e[3],{value:t,type:a.NumberType.Number}]}if(a.isTokenNumber(e)){3!==o&&n.syntaxFlags.add(exports.SyntaxFlag.HasNumberValues);let t=e[4].value;return 3===o&&(t=normalize(e[4].value,1,0,1)),[a.TokenType.Number,t.toString(),e[2],e[3],{value:t,type:a.NumberType.Number}]}return!1}function normalize_Lab_ChannelValues(e,o,n){if(a.isTokenIdent(e)&&"none"===toLowerCaseAZ(e[4].value))return n.syntaxFlags.add(exports.SyntaxFlag.HasNoneKeywords),[a.TokenType.Number,"none",e[2],e[3],{value:Number.NaN,type:a.NumberType.Number}];if(a.isTokenPercentage(e)){3!==o&&n.syntaxFlags.add(exports.SyntaxFlag.HasPercentageValues);let t=normalize(e[4].value,1,0,100);return 1===o||2===o?t=normalize(e[4].value,.8,-2147483647,2147483647):3===o&&(t=normalize(e[4].value,100,0,1)),[a.TokenType.Number,t.toString(),e[2],e[3],{value:t,type:a.NumberType.Number}]}if(a.isTokenNumber(e)){3!==o&&n.syntaxFlags.add(exports.SyntaxFlag.HasNumberValues);let t=normalize(e[4].value,1,0,100);return 1===o||2===o?t=normalize(e[4].value,1,-2147483647,2147483647):3===o&&(t=normalize(e[4].value,1,0,1)),[a.TokenType.Number,t.toString(),e[2],e[3],{value:t,type:a.NumberType.Number}]}return!1}function lab(e,o){return threeChannelSpaceSeparated(e,normalize_Lab_ChannelValues,exports.ColorNotation.Lab,[],o)}function normalize_LCH_ChannelValues(e,o,n){if(a.isTokenIdent(e)&&"none"===toLowerCaseAZ(e[4].value))return n.syntaxFlags.add(exports.SyntaxFlag.HasNoneKeywords),[a.TokenType.Number,"none",e[2],e[3],{value:Number.NaN,type:a.NumberType.Number}];if(2===o){const o=normalizeHue(e);return!1!==o&&(a.isTokenDimension(e)&&n.syntaxFlags.add(exports.SyntaxFlag.HasDimensionValues),o)}if(a.isTokenPercentage(e)){3!==o&&n.syntaxFlags.add(exports.SyntaxFlag.HasPercentageValues);let t=normalize(e[4].value,1,0,100);return 1===o?t=normalize(e[4].value,100/150,0,2147483647):3===o&&(t=normalize(e[4].value,100,0,1)),[a.TokenType.Number,t.toString(),e[2],e[3],{value:t,type:a.NumberType.Number}]}if(a.isTokenNumber(e)){3!==o&&n.syntaxFlags.add(exports.SyntaxFlag.HasNumberValues);let t=normalize(e[4].value,1,0,100);return 1===o?t=normalize(e[4].value,1,0,2147483647):3===o&&(t=normalize(e[4].value,1,0,1)),[a.TokenType.Number,t.toString(),e[2],e[3],{value:t,type:a.NumberType.Number}]}return!1}function lch(e,o){return threeChannelSpaceSeparated(e,normalize_LCH_ChannelValues,exports.ColorNotation.LCH,[],o)}const N=new Map;for(const[e,o]of Object.entries(n.namedColors))N.set(e,o);function namedColor(e){const o=N.get(toLowerCaseAZ(e));return!!o&&{colorNotation:exports.ColorNotation.RGB,channels:[o[0]/255,o[1]/255,o[2]/255],alpha:1,syntaxFlags:new Set([exports.SyntaxFlag.ColorKeyword,exports.SyntaxFlag.NamedColor])}}function normalize_OKLab_ChannelValues(e,o,n){if(a.isTokenIdent(e)&&"none"===toLowerCaseAZ(e[4].value))return n.syntaxFlags.add(exports.SyntaxFlag.HasNoneKeywords),[a.TokenType.Number,"none",e[2],e[3],{value:Number.NaN,type:a.NumberType.Number}];if(a.isTokenPercentage(e)){3!==o&&n.syntaxFlags.add(exports.SyntaxFlag.HasPercentageValues);let t=normalize(e[4].value,100,0,1);return 1===o||2===o?t=normalize(e[4].value,250,-2147483647,2147483647):3===o&&(t=normalize(e[4].value,100,0,1)),[a.TokenType.Number,t.toString(),e[2],e[3],{value:t,type:a.NumberType.Number}]}if(a.isTokenNumber(e)){3!==o&&n.syntaxFlags.add(exports.SyntaxFlag.HasNumberValues);let t=normalize(e[4].value,1,0,1);return 1===o||2===o?t=normalize(e[4].value,1,-2147483647,2147483647):3===o&&(t=normalize(e[4].value,1,0,1)),[a.TokenType.Number,t.toString(),e[2],e[3],{value:t,type:a.NumberType.Number}]}return!1}function oklab(e,o){return threeChannelSpaceSeparated(e,normalize_OKLab_ChannelValues,exports.ColorNotation.OKLab,[],o)}function normalize_OKLCH_ChannelValues(e,o,n){if(a.isTokenIdent(e)&&"none"===toLowerCaseAZ(e[4].value))return n.syntaxFlags.add(exports.SyntaxFlag.HasNoneKeywords),[a.TokenType.Number,"none",e[2],e[3],{value:Number.NaN,type:a.NumberType.Number}];if(2===o){const o=normalizeHue(e);return!1!==o&&(a.isTokenDimension(e)&&n.syntaxFlags.add(exports.SyntaxFlag.HasDimensionValues),o)}if(a.isTokenPercentage(e)){3!==o&&n.syntaxFlags.add(exports.SyntaxFlag.HasPercentageValues);let t=normalize(e[4].value,100,0,1);return 1===o?t=normalize(e[4].value,250,0,2147483647):3===o&&(t=normalize(e[4].value,100,0,1)),[a.TokenType.Number,t.toString(),e[2],e[3],{value:t,type:a.NumberType.Number}]}if(a.isTokenNumber(e)){3!==o&&n.syntaxFlags.add(exports.SyntaxFlag.HasNumberValues);let t=normalize(e[4].value,1,0,1);return 1===o?t=normalize(e[4].value,1,0,2147483647):3===o&&(t=normalize(e[4].value,1,0,1)),[a.TokenType.Number,t.toString(),e[2],e[3],{value:t,type:a.NumberType.Number}]}return!1}function oklch(e,o){return threeChannelSpaceSeparated(e,normalize_OKLCH_ChannelValues,exports.ColorNotation.OKLCH,[],o)}function normalize_legacy_sRGB_ChannelValues(e,o,n){if(a.isTokenPercentage(e)){3===o?n.syntaxFlags.add(exports.SyntaxFlag.HasPercentageAlpha):n.syntaxFlags.add(exports.SyntaxFlag.HasPercentageValues);const t=normalize(e[4].value,100,0,1);return[a.TokenType.Number,t.toString(),e[2],e[3],{value:t,type:a.NumberType.Number}]}if(a.isTokenNumber(e)){3!==o&&n.syntaxFlags.add(exports.SyntaxFlag.HasNumberValues);let t=normalize(e[4].value,255,0,1);return 3===o&&(t=normalize(e[4].value,1,0,1)),[a.TokenType.Number,t.toString(),e[2],e[3],{value:t,type:a.NumberType.Number}]}return!1}function normalize_modern_sRGB_ChannelValues(e,o,n){if(a.isTokenIdent(e)&&"none"===e[4].value.toLowerCase())return n.syntaxFlags.add(exports.SyntaxFlag.HasNoneKeywords),[a.TokenType.Number,"none",e[2],e[3],{value:Number.NaN,type:a.NumberType.Number}];if(a.isTokenPercentage(e)){3!==o&&n.syntaxFlags.add(exports.SyntaxFlag.HasPercentageValues);let t=normalize(e[4].value,100,-2147483647,2147483647);return 3===o&&(t=normalize(e[4].value,100,0,1)),[a.TokenType.Number,t.toString(),e[2],e[3],{value:t,type:a.NumberType.Number}]}if(a.isTokenNumber(e)){3!==o&&n.syntaxFlags.add(exports.SyntaxFlag.HasNumberValues);let t=normalize(e[4].value,255,-2147483647,2147483647);return 3===o&&(t=normalize(e[4].value,1,0,1)),[a.TokenType.Number,t.toString(),e[2],e[3],{value:t,type:a.NumberType.Number}]}return!1}function rgb(e,o){if(e.value.some(e=>t.isTokenNode(e)&&a.isTokenComma(e.value))){const o=rgbCommaSeparated(e);if(!1!==o)return(!o.syntaxFlags.has(exports.SyntaxFlag.HasNumberValues)||!o.syntaxFlags.has(exports.SyntaxFlag.HasPercentageValues))&&o}else{const a=rgbSpaceSeparated(e,o);if(!1!==a)return a}return!1}function rgbCommaSeparated(e){return threeChannelLegacySyntax(e,normalize_legacy_sRGB_ChannelValues,exports.ColorNotation.RGB,[exports.SyntaxFlag.LegacyRGB])}function rgbSpaceSeparated(e,o){return threeChannelSpaceSeparated(e,normalize_modern_sRGB_ChannelValues,exports.ColorNotation.RGB,[],o)}function XYZ_D50_to_sRGB_Gamut(e){const o=n.XYZ_D50_to_sRGB(e);if(n.inGamut(o))return n.clip(o);let a=e;return a=n.XYZ_D50_to_OKLCH(a),a[0]<1e-6&&(a=[0,0,0]),a[0]>.999999&&(a=[1,0,0]),n.gam_sRGB(n.mapGamutRayTrace(a,oklch_to_lin_srgb,lin_srgb_to_oklch))}function oklch_to_lin_srgb(e){return e=n.OKLCH_to_OKLab(e),e=n.OKLab_to_XYZ(e),n.XYZ_to_lin_sRGB(e)}function lin_srgb_to_oklch(e){return e=n.lin_sRGB_to_XYZ(e),e=n.XYZ_to_OKLab(e),n.OKLab_to_OKLCH(e)}function contrastColor(e,o){let a=!1;for(let n=0;n<e.value.length;n++){const r=e.value[n];if(!t.isWhitespaceNode(r)&&!t.isCommentNode(r)&&(a||(a=o(r),!a)))return!1}if(!a)return!1;a.channels=convertNaNToZero(a.channels),a.channels=XYZ_D50_to_sRGB_Gamut(colorData_to_XYZ_D50(a).channels),a.colorNotation=exports.ColorNotation.sRGB;const r={colorNotation:exports.ColorNotation.sRGB,channels:[0,0,0],alpha:1,syntaxFlags:new Set([exports.SyntaxFlag.ContrastColor,exports.SyntaxFlag.Experimental])},l=n.contrast_ratio_wcag_2_1(a.channels,[1,1,1]),s=n.contrast_ratio_wcag_2_1(a.channels,[0,0,0]);return r.channels=l>s?[1,1,1]:[0,0,0],r}function alpha(e,o){let n,l,s=!1,i=!1,u=!1;const c={colorNotation:exports.ColorNotation.sRGB,channels:[0,0,0],alpha:1,syntaxFlags:new Set([])};for(let p=0;p<e.value.length;p++){let N=e.value[p];if(t.isWhitespaceNode(N)||t.isCommentNode(N))for(;t.isWhitespaceNode(e.value[p+1])||t.isCommentNode(e.value[p+1]);)p++;else if(u&&!s&&!i&&t.isTokenNode(N)&&a.isTokenDelim(N.value)&&"/"===N.value[4].value)s=!0;else{if(t.isFunctionNode(N)&&r.mathFunctionNames.has(toLowerCaseAZ(N.getName()))){const[[e]]=r.calcFromComponentValues([[N]],{censorIntoStandardRepresentableValues:!0,globals:l,precision:-1,toCanonicalUnits:!0,rawPercentages:!0});if(!e||!t.isTokenNode(e)||!a.isTokenNumeric(e.value))return!1;Number.isNaN(e.value[4].value)&&(e.value[4].value=0),N=e}if(s||i||!t.isTokenNode(N)||!a.isTokenIdent(N.value)||"from"!==toLowerCaseAZ(N.value[4].value)){if(!s)return!1;if(i)return!1;if(t.isTokenNode(N)){if(a.isTokenIdent(N.value)&&"alpha"===toLowerCaseAZ(N.value[4].value)&&n&&n.has("alpha")){c.alpha=n.get("alpha")[4].value,i=!0;continue}const e=normalize_Color_ChannelValues(N.value,3,c);if(!e||!a.isTokenNumber(e))return!1;c.alpha=new t.TokenNode(e),i=!0;continue}if(t.isFunctionNode(N)){const e=t.replaceComponentValues([[N]],e=>{if(t.isTokenNode(e)&&a.isTokenIdent(e.value)&&"alpha"===toLowerCaseAZ(e.value[4].value)&&n&&n.has("alpha"))return new t.TokenNode(n.get("alpha"))});c.alpha=e[0][0],i=!0;continue}return!1}if(u)return!1;for(;t.isWhitespaceNode(e.value[p+1])||t.isCommentNode(e.value[p+1]);)p++;if(p++,N=e.value[p],u=o(N),!1===u)return!1;n=normalizeRelativeColorDataChannels(u),l=noneToZeroInRelativeColorDataChannels(n),c.syntaxFlags=new Set(u.syntaxFlags),c.syntaxFlags.add(exports.SyntaxFlag.RelativeAlphaSyntax),c.channels=[...u.channels],c.colorNotation=u.colorNotation,c.alpha=u.alpha}}return!!n&&c}function XYZ_D50_to_P3_Gamut(e){const o=n.XYZ_D50_to_P3(e);if(n.inGamut(o))return n.clip(o);let a=e;return a=n.XYZ_D50_to_OKLCH(a),a[0]<1e-6&&(a=[0,0,0]),a[0]>.999999&&(a=[1,0,0]),n.gam_P3(n.mapGamutRayTrace(a,oklch_to_lin_p3,lin_p3_to_oklch))}function oklch_to_lin_p3(e){return e=n.OKLCH_to_OKLab(e),e=n.OKLab_to_XYZ(e),n.XYZ_to_lin_P3(e)}function lin_p3_to_oklch(e){return e=n.lin_P3_to_XYZ(e),e=n.XYZ_to_OKLab(e),n.OKLab_to_OKLCH(e)}function toPrecision(e,o=7){e=+e,o=+o;const a=(Math.floor(Math.abs(e))+"").length;if(o>a)return+e.toFixed(o-a);{const n=10**(a-o);return Math.round(e/n)*n}}function serializeWithAlpha(e,o,n,r){const l=[a.TokenType.CloseParen,")",-1,-1,void 0];if("number"==typeof e.alpha){const s=Math.min(1,Math.max(0,toPrecision(Number.isNaN(e.alpha)?0:e.alpha)));return 1===toPrecision(s,4)?new t.FunctionNode(o,l,r):new t.FunctionNode(o,l,[...r,new t.WhitespaceNode([n]),new t.TokenNode([a.TokenType.Delim,"/",-1,-1,{value:"/"}]),new t.WhitespaceNode([n]),new t.TokenNode([a.TokenType.Number,toPrecision(s,4).toString(),-1,-1,{value:e.alpha,type:a.NumberType.Integer}])])}return new t.FunctionNode(o,l,[...r,new t.WhitespaceNode([n]),new t.TokenNode([a.TokenType.Delim,"/",-1,-1,{value:"/"}]),new t.WhitespaceNode([n]),e.alpha])}exports.color=function color(e){if(t.isFunctionNode(e)){switch(toLowerCaseAZ(e.getName())){case"rgb":case"rgba":return rgb(e,color);case"hsl":case"hsla":return hsl(e,color);case"hwb":return o=color,threeChannelSpaceSeparated(e,normalize_HWB_ChannelValues,exports.ColorNotation.HWB,[],o);case"lab":return lab(e,color);case"lch":return lch(e,color);case"oklab":return oklab(e,color);case"oklch":return oklch(e,color);case"color":return color$1(e,color);case"color-mix":return colorMix(e,color);case"contrast-color":return contrastColor(e,color);case"alpha":return alpha(e,color)}}var o;if(t.isTokenNode(e)){if(a.isTokenHash(e.value))return hex(e.value);if(a.isTokenIdent(e.value)){const o=namedColor(e.value[4].value);return!1!==o?o:"transparent"===toLowerCaseAZ(e.value[4].value)&&{colorNotation:exports.ColorNotation.RGB,channels:[0,0,0],alpha:0,syntaxFlags:new Set([exports.SyntaxFlag.ColorKeyword])}}}return!1},exports.colorDataFitsDisplayP3_Gamut=function colorDataFitsDisplayP3_Gamut(e){const o={...e,channels:[...e.channels]};return o.channels=convertPowerlessComponentsToZeroValuesForDisplay(o.channels,o.colorNotation),!colorDataTo(o,exports.ColorNotation.Display_P3).channels.find(e=>e<-1e-5||e>1.00001)},exports.colorDataFitsRGB_Gamut=function colorDataFitsRGB_Gamut(e){const o={...e,channels:[...e.channels]};return o.channels=convertPowerlessComponentsToZeroValuesForDisplay(o.channels,o.colorNotation),!colorDataTo(o,exports.ColorNotation.RGB).channels.find(e=>e<-1e-5||e>1.00001)},exports.serializeHSL=function serializeHSL(e,o=!0){e.channels=convertPowerlessComponentsToZeroValuesForDisplay(e.channels,e.colorNotation);let r=e.channels.map(e=>Number.isNaN(e)?0:e);r=o?n.XYZ_D50_to_HSL(n.sRGB_to_XYZ_D50(XYZ_D50_to_sRGB_Gamut(colorData_to_XYZ_D50(e).channels))):n.XYZ_D50_to_HSL(colorData_to_XYZ_D50(e).channels),r=r.map(e=>Number.isNaN(e)?0:e);const l=Math.min(360,Math.max(0,Math.round(toPrecision(r[0])))),s=Math.min(100,Math.max(0,Math.round(toPrecision(r[1])))),i=Math.min(100,Math.max(0,Math.round(toPrecision(r[2])))),u=[a.TokenType.CloseParen,")",-1,-1,void 0],c=[a.TokenType.Whitespace," ",-1,-1,void 0],p=[a.TokenType.Comma,",",-1,-1,void 0],N=[new t.TokenNode([a.TokenType.Number,l.toString(),-1,-1,{value:r[0],type:a.NumberType.Integer}]),new t.TokenNode(p),new t.WhitespaceNode([c]),new t.TokenNode([a.TokenType.Percentage,s.toString()+"%",-1,-1,{value:r[1]}]),new t.TokenNode(p),new t.WhitespaceNode([c]),new t.TokenNode([a.TokenType.Percentage,i.toString()+"%",-1,-1,{value:r[2]}])];if("number"==typeof e.alpha){const o=Math.min(1,Math.max(0,toPrecision(Number.isNaN(e.alpha)?0:e.alpha)));return 1===toPrecision(o,4)?new t.FunctionNode([a.TokenType.Function,"hsl(",-1,-1,{value:"hsl"}],u,N):new t.FunctionNode([a.TokenType.Function,"hsla(",-1,-1,{value:"hsla"}],u,[...N,new t.TokenNode(p),new t.WhitespaceNode([c]),new t.TokenNode([a.TokenType.Number,toPrecision(o,4).toString(),-1,-1,{value:e.alpha,type:a.NumberType.Number}])])}return new t.FunctionNode([a.TokenType.Function,"hsla(",-1,-1,{value:"hsla"}],u,[...N,new t.TokenNode(p),new t.WhitespaceNode([c]),e.alpha])},exports.serializeOKLCH=function serializeOKLCH(e){e.channels=convertPowerlessComponentsToZeroValuesForDisplay(e.channels,e.colorNotation);let o=e.channels.map(e=>Number.isNaN(e)?0:e);e.colorNotation!==exports.ColorNotation.OKLCH&&(o=n.XYZ_D50_to_OKLCH(colorData_to_XYZ_D50(e).channels));const r=toPrecision(o[0],6),l=toPrecision(o[1],6),s=toPrecision(o[2],6),i=[a.TokenType.Function,"oklch(",-1,-1,{value:"oklch"}],u=[a.TokenType.Whitespace," ",-1,-1,void 0];return serializeWithAlpha(e,i,u,[new t.TokenNode([a.TokenType.Number,r.toString(),-1,-1,{value:o[0],type:a.NumberType.Number}]),new t.WhitespaceNode([u]),new t.TokenNode([a.TokenType.Number,l.toString(),-1,-1,{value:o[1],type:a.NumberType.Number}]),new t.WhitespaceNode([u]),new t.TokenNode([a.TokenType.Number,s.toString(),-1,-1,{value:o[2],type:a.NumberType.Number}])])},exports.serializeP3=function serializeP3(e,o=!0){e.channels=convertPowerlessComponentsToZeroValuesForDisplay(e.channels,e.colorNotation);let r=e.channels.map(e=>Number.isNaN(e)?0:e);o?r=XYZ_D50_to_P3_Gamut(colorData_to_XYZ_D50(e).channels):e.colorNotation!==exports.ColorNotation.Display_P3&&(r=n.XYZ_D50_to_P3(colorData_to_XYZ_D50(e).channels));const l=o?Math.min(1,Math.max(0,toPrecision(r[0],6))):toPrecision(r[0],6),s=o?Math.min(1,Math.max(0,toPrecision(r[1],6))):toPrecision(r[1],6),i=o?Math.min(1,Math.max(0,toPrecision(r[2],6))):toPrecision(r[2],6),u=[a.TokenType.Function,"color(",-1,-1,{value:"color"}],c=[a.TokenType.Whitespace," ",-1,-1,void 0];return serializeWithAlpha(e,u,c,[new t.TokenNode([a.TokenType.Ident,"display-p3",-1,-1,{value:"display-p3"}]),new t.WhitespaceNode([c]),new t.TokenNode([a.TokenType.Number,l.toString(),-1,-1,{value:r[0],type:a.NumberType.Number}]),new t.WhitespaceNode([c]),new t.TokenNode([a.TokenType.Number,s.toString(),-1,-1,{value:r[1],type:a.NumberType.Number}]),new t.WhitespaceNode([c]),new t.TokenNode([a.TokenType.Number,i.toString(),-1,-1,{value:r[2],type:a.NumberType.Number}])])},exports.serializeRGB=function serializeRGB(e,o=!0){e.channels=convertPowerlessComponentsToZeroValuesForDisplay(e.channels,e.colorNotation);let r=e.channels.map(e=>Number.isNaN(e)?0:e);r=o?XYZ_D50_to_sRGB_Gamut(colorData_to_XYZ_D50(e).channels):n.XYZ_D50_to_sRGB(colorData_to_XYZ_D50(e).channels);const l=Math.min(255,Math.max(0,Math.round(255*toPrecision(r[0])))),s=Math.min(255,Math.max(0,Math.round(255*toPrecision(r[1])))),i=Math.min(255,Math.max(0,Math.round(255*toPrecision(r[2])))),u=[a.TokenType.CloseParen,")",-1,-1,void 0],c=[a.TokenType.Whitespace," ",-1,-1,void 0],p=[a.TokenType.Comma,",",-1,-1,void 0],N=[new t.TokenNode([a.TokenType.Number,l.toString(),-1,-1,{value:Math.min(255,255*Math.max(0,r[0])),type:a.NumberType.Integer}]),new t.TokenNode(p),new t.WhitespaceNode([c]),new t.TokenNode([a.TokenType.Number,s.toString(),-1,-1,{value:Math.min(255,255*Math.max(0,r[1])),type:a.NumberType.Integer}]),new t.TokenNode(p),new t.WhitespaceNode([c]),new t.TokenNode([a.TokenType.Number,i.toString(),-1,-1,{value:Math.min(255,255*Math.max(0,r[2])),type:a.NumberType.Integer}])];if("number"==typeof e.alpha){const o=Math.min(1,Math.max(0,toPrecision(Number.isNaN(e.alpha)?0:e.alpha)));return 1===toPrecision(o,4)?new t.FunctionNode([a.TokenType.Function,"rgb(",-1,-1,{value:"rgb"}],u,N):new t.FunctionNode([a.TokenType.Function,"rgba(",-1,-1,{value:"rgba"}],u,[...N,new t.TokenNode(p),new t.WhitespaceNode([c]),new t.TokenNode([a.TokenType.Number,toPrecision(o,4).toString(),-1,-1,{value:e.alpha,type:a.NumberType.Number}])])}return new t.FunctionNode([a.TokenType.Function,"rgba(",-1,-1,{value:"rgba"}],u,[...N,new t.TokenNode(p),new t.WhitespaceNode([c]),e.alpha])};
 
 
 /***/ }),
 
-/***/ 69002:
+/***/ 85181:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 "use strict";
@@ -333971,7 +334046,7 @@ function cleanParams(params, data) {
     const p2 = typeof p === "string" ? { message: p } : p;
     return p2;
 }
-function custom(check, _params = {}, 
+function custom(check, _params = {},
 /**
  * @deprecated
  *
@@ -337901,7 +337976,7 @@ exports.$ZodCheckGreaterThan = core.$constructor("$ZodCheckGreaterThan", (inst, 
         });
     };
 });
-exports.$ZodCheckMultipleOf = 
+exports.$ZodCheckMultipleOf =
 /*@__PURE__*/ core.$constructor("$ZodCheckMultipleOf", (inst, def) => {
     exports.$ZodCheck.init(inst, def);
     inst._zod.onattach.push((inst) => {
@@ -340870,7 +340945,7 @@ exports.$ZodObjectJIT = core.$constructor("$ZodObjectJIT", (inst, def) => {
             })));
           }
         }
-        
+
         if (${id}.value === undefined) {
           if (${k} in input) {
             newResult[${k}] = undefined;
@@ -340878,7 +340953,7 @@ exports.$ZodObjectJIT = core.$constructor("$ZodObjectJIT", (inst, def) => {
         } else {
           newResult[${k}] = ${id}.value;
         }
-        
+
       `);
             }
             else {
@@ -340889,7 +340964,7 @@ exports.$ZodObjectJIT = core.$constructor("$ZodObjectJIT", (inst, def) => {
             path: iss.path ? [${k}, ...iss.path] : [${k}]
           })));
         }
-        
+
         if (${id}.value === undefined) {
           if (${k} in input) {
             newResult[${k}] = undefined;
@@ -340897,7 +340972,7 @@ exports.$ZodObjectJIT = core.$constructor("$ZodObjectJIT", (inst, def) => {
         } else {
           newResult[${k}] = ${id}.value;
         }
-        
+
       `);
             }
         }
@@ -341062,7 +341137,7 @@ exports.$ZodXor = core.$constructor("$ZodXor", (inst, def) => {
         });
     };
 });
-exports.$ZodDiscriminatedUnion = 
+exports.$ZodDiscriminatedUnion =
 /*@__PURE__*/
 core.$constructor("$ZodDiscriminatedUnion", (inst, def) => {
     def.inclusive = false;
@@ -355778,7 +355853,7 @@ const decodeMap = new Map([
 /**
  * Polyfill for `String.fromCodePoint`. It is used to create a string from a Unicode code point.
  */
-const decode_codepoint_fromCodePoint = 
+const decode_codepoint_fromCodePoint =
 // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition, n/no-unsupported-features/es-builtins
 (_a = String.fromCodePoint) !== null && _a !== void 0 ? _a : function (codePoint) {
     let output = "";
@@ -355885,7 +355960,7 @@ var DecodingMode;
 class EntityDecoder {
     constructor(
     /** The tree used to decode entities. */
-    decodeTree, 
+    decodeTree,
     /**
      * The function that is called when a codepoint is decoded.
      *
@@ -355895,7 +355970,7 @@ class EntityDecoder {
      * @param codepoint The decoded codepoint.
      * @param consumed The number of bytes consumed by the decoder.
      */
-    emitCodePoint, 
+    emitCodePoint,
     /** An object that is used to produce errors. */
     errors) {
         this.decodeTree = decodeTree;
@@ -356208,7 +356283,7 @@ function getDecoder(decodeTree) {
         while ((offset = input.indexOf("&", offset)) >= 0) {
             returnValue += input.slice(lastIndex, offset);
             decoder.startEntity(decodeMode);
-            const length = decoder.write(input, 
+            const length = decoder.write(input,
             // Skip the "&"
             offset + 1);
             if (length < 0) {
@@ -360568,9 +360643,9 @@ const defaultParserOptions = {
 };
 //Parser
 class Parser {
-    constructor(options, document, 
+    constructor(options, document,
     /** @internal */
-    fragmentContext = null, 
+    fragmentContext = null,
     /** @internal */
     scriptHandler = null) {
         this.fragmentContext = fragmentContext;
@@ -360891,7 +360966,7 @@ class Parser {
         if (this.treeAdapter.getNodeSourceCodeLocation(element) && closingToken.location) {
             const ctLoc = closingToken.location;
             const tn = this.treeAdapter.getTagName(element);
-            const endLoc = 
+            const endLoc =
             // NOTE: For cases like <p> <p> </p> - First 'p' closes without a closing
             // tag and for cases like <td> <p> </td> - 'p' closes without a closing tag.
             closingToken.type === TokenType.END_TAG && tn === closingToken.tagName
@@ -363765,7 +363840,7 @@ const xmlCodeMap = new Map([
     [62, "&gt;"],
 ]);
 // For compatibility with node < 4, we wrap `codePointAt`
-const getCodePoint = 
+const getCodePoint =
 // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
 String.prototype.codePointAt == null
     ? (c, index) => (c.charCodeAt(index) & 64512) === 55296
@@ -363854,7 +363929,7 @@ const escapeUTF8 = /* #__PURE__ */ (/* unused pure expression or super */ null &
  *
  * @param data String to escape.
  */
-const escapeAttribute = 
+const escapeAttribute =
 /* #__PURE__ */ getEscaper(/["&\u00A0]/g, new Map([
     [34, "&quot;"],
     [38, "&amp;"],
@@ -364190,7 +364265,7 @@ module.exports = /*#__PURE__*/JSON.parse('[[[0,44],2],[[45,46],2],[47,2],[[48,57
 /************************************************************************/
 /******/ 	// The module cache
 /******/ 	var __webpack_module_cache__ = {};
-/******/ 	
+/******/
 /******/ 	// The require function
 /******/ 	function __nccwpck_require__(moduleId) {
 /******/ 		// Check if module is in cache
@@ -364204,7 +364279,7 @@ module.exports = /*#__PURE__*/JSON.parse('[[[0,44],2],[[45,46],2],[47,2],[[48,57
 /******/ 			// no module.loaded needed
 /******/ 			exports: {}
 /******/ 		};
-/******/ 	
+/******/
 /******/ 		// Execute the module function
 /******/ 		var threw = true;
 /******/ 		try {
@@ -364213,11 +364288,11 @@ module.exports = /*#__PURE__*/JSON.parse('[[[0,44],2],[[45,46],2],[47,2],[[48,57
 /******/ 		} finally {
 /******/ 			if(threw) delete __webpack_module_cache__[moduleId];
 /******/ 		}
-/******/ 	
+/******/
 /******/ 		// Return the exports of the module
 /******/ 		return module.exports;
 /******/ 	}
-/******/ 	
+/******/
 /************************************************************************/
 /******/ 	/* webpack/runtime/create fake namespace object */
 /******/ 	(() => {
@@ -364248,7 +364323,7 @@ module.exports = /*#__PURE__*/JSON.parse('[[[0,44],2],[[45,46],2],[47,2],[[48,57
 /******/ 			return ns;
 /******/ 		};
 /******/ 	})();
-/******/ 	
+/******/
 /******/ 	/* webpack/runtime/define property getters */
 /******/ 	(() => {
 /******/ 		// define getter functions for harmony exports
@@ -364260,12 +364335,12 @@ module.exports = /*#__PURE__*/JSON.parse('[[[0,44],2],[[45,46],2],[47,2],[[48,57
 /******/ 			}
 /******/ 		};
 /******/ 	})();
-/******/ 	
+/******/
 /******/ 	/* webpack/runtime/hasOwnProperty shorthand */
 /******/ 	(() => {
 /******/ 		__nccwpck_require__.o = (obj, prop) => (Object.prototype.hasOwnProperty.call(obj, prop))
 /******/ 	})();
-/******/ 	
+/******/
 /******/ 	/* webpack/runtime/make namespace object */
 /******/ 	(() => {
 /******/ 		// define __esModule on exports
@@ -364276,18 +364351,18 @@ module.exports = /*#__PURE__*/JSON.parse('[[[0,44],2],[[45,46],2],[47,2],[[48,57
 /******/ 			Object.defineProperty(exports, '__esModule', { value: true });
 /******/ 		};
 /******/ 	})();
-/******/ 	
+/******/
 /******/ 	/* webpack/runtime/compat */
-/******/ 	
+/******/
 /******/ 	if (typeof __nccwpck_require__ !== 'undefined') __nccwpck_require__.ab = __dirname + "/";
-/******/ 	
+/******/
 /************************************************************************/
-/******/ 	
+/******/
 /******/ 	// startup
 /******/ 	// Load entry module and return exports
 /******/ 	// This entry module is referenced by other modules so it can't be inlined
 /******/ 	var __webpack_exports__ = __nccwpck_require__(11522);
 /******/ 	module.exports = __webpack_exports__;
-/******/ 	
+/******/
 /******/ })()
 ;

@@ -7,6 +7,19 @@ branding:
   color: "green"
 
 inputs:
+  isolated_mode:
+    description: "Generate a local read-only report without GitHub writes"
+    required: false
+    default: "false"
+  repository_path:
+    description: "Repository root available to read-only tools"
+    required: false
+  review_input:
+    description: "Trusted JSON input describing the PR and patches"
+    required: false
+  report_path:
+    description: "Output path for the structured review report"
+    required: false
   github_token:
     description: "GitHub token for API access"
     required: true
