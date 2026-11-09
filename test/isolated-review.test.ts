@@ -1,6 +1,6 @@
 jest.mock("jsdom", () => ({ JSDOM: class {} }));
 
-import { getAllTools, resolveRepoPath } from "../src/agent/tools";
+import { getAllTools, resolveRepoPath, runSearchRepo } from "../src/agent/tools";
 
 describe("isolated review tools", () => {
   const previous = process.env.ISOLATED_REVIEW;
@@ -23,5 +23,14 @@ describe("isolated review tools", () => {
     expect(resolveRepoPath("../outside.txt")).toBeNull();
     expect(resolveRepoPath("/etc/passwd")).toBeNull();
     expect(resolveRepoPath("docs/development-workflow.md")).not.toBeNull();
+  });
+
+  it("refuses repository searches scoped outside the repository root", async () => {
+    await expect(runSearchRepo({ query: "secret", paths: ["../"] })).rejects.toThrow(
+      "Search path is outside the repository",
+    );
+    await expect(runSearchRepo({ query: "secret", paths: ["/etc"] })).rejects.toThrow(
+      "Search path is outside the repository",
+    );
   });
 });

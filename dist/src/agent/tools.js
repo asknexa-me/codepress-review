@@ -4,6 +4,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 };
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.allTools = exports.webSearchTool = exports.webFetchTool = exports.todoTool = exports.bashTool = exports.searchRepoTool = exports.depGraphTool = exports.fetchSnippetTool = exports.fetchFilesTool = void 0;
+exports.resolveRepoPath = resolveRepoPath;
 exports.runSearchRepo = runSearchRepo;
 exports.resetTodoList = resetTodoList;
 exports.getAllTools = getAllTools;
@@ -26,6 +27,14 @@ const agentTodoList = [];
 // Lightweight in-process LRU cache for search results
 const SEARCH_CACHE = new Map();
 const LRU_MAX = 100;
+function resolveRepoPath(path) {
+    const root = (0, path_1.resolve)(process.cwd());
+    const target = (0, path_1.resolve)(root, path);
+    if (target !== root && !target.startsWith(`${root}\\`) && !target.startsWith(`${root}/`)) {
+        return null;
+    }
+    return target;
+}
 /**
  * Resolve a working ripgrep binary path.
  * - Prefer @vscode/ripgrep's downloaded binary if it exists
@@ -325,7 +334,9 @@ exports.fetchFilesTool = (0, agents_1.tool)({
     execute: async ({ paths }) => {
         const outputs = [];
         for (const path of paths) {
-            const absolutePath = (0, path_1.resolve)(process.cwd(), path);
+            const absolutePath = resolveRepoPath(path);
+            if (!absolutePath)
+                return `Error: Path escapes repository root: ${path}`;
             if (!(0, fs_1.existsSync)(absolutePath)) {
                 outputs.push(`=== ${path} ===\nError: File not found at ${path}`);
                 continue;
@@ -361,7 +372,9 @@ exports.fetchSnippetTool = (0, agents_1.tool)({
             .describe("Number of lines before and after the match to include (default: 5)"),
     }),
     execute: async ({ path, searchText, contextLines = 5 }) => {
-        const absolutePath = (0, path_1.resolve)(process.cwd(), path);
+        const absolutePath = resolveRepoPath(path);
+        if (!absolutePath)
+            return `Error: Path escapes repository root: ${path}`;
         if (!(0, fs_1.existsSync)(absolutePath)) {
             return `Error: File not found at ${path}`;
         }
@@ -420,7 +433,10 @@ exports.depGraphTool = (0, agents_1.tool)({
         depth: zod_1.z.number().int().min(1).describe("Depth of the graph to traverse"),
     }),
     execute: async ({ path, depth }) => {
-        if (!(0, fs_1.existsSync)((0, path_1.resolve)(process.cwd(), path))) {
+        const absolutePath = resolveRepoPath(path);
+        if (!absolutePath)
+            return `Error: Path escapes repository root: ${path}`;
+        if (!(0, fs_1.existsSync)(absolutePath)) {
             return `Error: File not found at ${path}`;
         }
         const allFiles = getAllSourceFiles();
@@ -480,13 +496,22 @@ exports.depGraphTool = (0, agents_1.tool)({
  */
 async function runSearchRepo(params) {
     const { query, caseSensitive = null, regex = null, wordBoundary = null, extensions = null, paths = null, contextLines = 5, maxResults = 200, } = params;
+    const safePaths = Array.isArray(paths)
+        ? paths.map((candidate) => {
+            const absolutePath = resolveRepoPath(candidate);
+            if (!absolutePath) {
+                throw new Error(`Search path is outside the repository: ${candidate}`);
+            }
+            return (0, path_1.relative)(process.cwd(), absolutePath) || ".";
+        })
+        : null;
     const cacheKey = {
         q: query,
         cs: caseSensitive,
         rx: regex,
         wb: wordBoundary,
         exts: Array.isArray(extensions) ? [...extensions].sort().join(",") : null,
-        p: Array.isArray(paths) ? [...paths].sort().join(",") : null,
+        p: Array.isArray(safePaths) ? [...safePaths].sort().join(",") : null,
         cl: contextLines,
         mr: maxResults,
     };
@@ -499,7 +524,7 @@ async function runSearchRepo(params) {
         return cached;
     }
     // Build ignore set from .codepressignore and defaults
-    const codepressIgnoreFiles = findCodepressIgnoreFiles(paths);
+    const codepressIgnoreFiles = findCodepressIgnoreFiles(safePaths);
     const ig = buildIgnoreMatcher(codepressIgnoreFiles);
     // Prefer ripgrep if available. It respects .gitignore and is fast.
     try {
@@ -537,8 +562,8 @@ async function runSearchRepo(params) {
         // Pattern
         args.push(pattern);
         // Paths scope or default to current directory
-        if (Array.isArray(paths) && paths.length > 0) {
-            for (const p of paths)
+        if (Array.isArray(safePaths) && safePaths.length > 0) {
+            for (const p of safePaths)
                 args.push(p);
         }
         else {
@@ -1236,7 +1261,6 @@ Be specific in your queries for better results.`,
 });
 // Base tools always included
 const baseTools = [
-    exports.bashTool,
     exports.depGraphTool,
     exports.todoTool,
     exports.fetchFilesTool,
@@ -1250,6 +1274,8 @@ const webTools = [exports.webFetchTool, exports.webSearchTool];
  * Web search tools are enabled by default but can be disabled via ENABLE_WEB_SEARCH=false.
  */
 function getAllTools() {
+    if (process.env.ISOLATED_REVIEW === "true")
+        return baseTools;
     const enableWebSearch = process.env.ENABLE_WEB_SEARCH?.toLowerCase() !== "false";
     return enableWebSearch ? [...baseTools, ...webTools] : baseTools;
 }

@@ -685,14 +685,6 @@ const ReviewCompletionSchema = zod_1.z.object({
     commentsPosted: zod_1.z.number().describe("Number of inline comments posted during this review"),
     /** The review verdict submitted */
     verdict: zod_1.z.enum(["APPROVE", "REQUEST_CHANGES", "COMMENT", "NONE"]).describe("The verdict submitted with gh pr review, or NONE if no review was submitted"),
-    findings: zod_1.z.array(zod_1.z.object({
-        severity: zod_1.z.enum(["required", "optional"]),
-        path: zod_1.z.string(),
-        line: zod_1.z.number().int().positive().nullable(),
-        title: zod_1.z.string(),
-        body: zod_1.z.string(),
-        evidence: zod_1.z.string(),
-    })).default([]),
 });
 /**
  * Formats existing review comments from OTHER reviewers into a readable string.
@@ -843,12 +835,10 @@ blockingOnly = false, existingComments = [], botPreviousComments = [], relatedRe
     const model = await (0, model_factory_1.createModel)(modelConfig);
     // Create the intervention filter
     const interventionFilter = createInterventionFilter(reviewState);
-    const isolatedReview = process.env.ISOLATED_REVIEW === "true";
-    const isolatedInstructions = `You are a read-only code review agent. You may read and search only files under the current repository root. Read docs/development-workflow.md, .codex/rules, the relevant docs/design file, and related architecture documents before deciding. Trace callers and dependencies with the available read-only tools. Never request, reveal, or infer credentials. Do not modify files, execute commands, access the network, post comments, edit a pull request, approve, merge, or deploy. Return structured findings only. A successful run means the review completed; it never means findings were fixed.`;
     const agent = new agents_1.Agent({
         model: (0, agents_extensions_1.aisdk)(model),
         name: "CodePressReviewAgent",
-        instructions: isolatedReview ? isolatedInstructions : (0, agent_system_prompt_1.getInteractiveSystemPrompt)(blockingOnly, maxTurns),
+        instructions: (0, agent_system_prompt_1.getInteractiveSystemPrompt)(blockingOnly, maxTurns),
         tools: (0, tools_1.getAllTools)(),
         // Structured output type - the loop continues until this is produced
         // Using z.literal(true) for `completed` ensures the agent must explicitly
@@ -931,7 +921,7 @@ Only review the files listed above. Fetch individual patches as needed, not the 
 Files will be fetched via: \`gh api repos/${prContext.repo}/pulls/${prContext.prNumber}/files\`
 Note: Lock files, build outputs, and generated files should be skipped.
 </prFiles>\n`;
-    const originalInitialMessage = `
+    const initialMessage = `
 You are reviewing PR #${prContext.prNumber} in repository ${prContext.repo}.
 Commit SHA: ${prContext.commitSha}
 
@@ -1039,7 +1029,6 @@ ${blockingOnly ? "- BLOCKING-ONLY MODE: Only comment on critical issues that MUS
 ${isReReview ? "" : `
 **Remember: You MUST submit a formal review at the end using \`gh pr review\`.`}
 </instruction>`;
-    const initialMessage = isolatedReview ? `Review PR #${prContext.prNumber} at commit ${prContext.commitSha}.\n\n<repositoryFiles>\n${fileList}\n</repositoryFiles>\n\n${prFilesSection}\n\nRead the repository development rules and relevant architecture/design documents. Review every changed file, then trace related callers and contracts. Return a concise summary, verdict, and findings. Set commentsPosted to 0 because publishing is handled by a separate trusted job.` : originalInitialMessage;
     // Create a runner with custom workflow name for tracing
     const runner = new agents_1.Runner({
         workflowName: `${prContext.repo}#${prContext.prNumber}`,
@@ -1066,7 +1055,7 @@ ${isReReview ? "" : `
         // When maxTurns is null (meaning "unlimited"), we pass a very large number.
         const effectiveMaxTurns = maxTurns ?? Number.MAX_SAFE_INTEGER;
         const runOptions = {
-            ...(isolatedReview ? {} : { callModelInputFilter: interventionFilter }),
+            callModelInputFilter: interventionFilter,
             maxTurns: effectiveMaxTurns,
         };
         const result = await runner.run(agent, initialMessage, runOptions);
@@ -1076,13 +1065,11 @@ ${isReReview ? "" : `
             (0, debug_1.debugLog)(`  Summary: ${result.finalOutput.summary}`);
             (0, debug_1.debugLog)(`  Comments posted (self-reported): ${result.finalOutput.commentsPosted}`);
             (0, debug_1.debugLog)(`  Comments posted (tracked): ${reviewState.commentsPostedThisRun.length}`);
-            return result.finalOutput;
         }
         else {
             (0, debug_1.debugLog)("Agent completed without structured output (unexpected).");
             (0, debug_1.debugLog)(`  Comments posted this run: ${reviewState.commentsPostedThisRun.length}`);
             (0, debug_1.debugLog)(`  Review submitted: ${reviewState.hasSubmittedReview}`);
-            throw new Error("Agent completed without structured review output");
         }
     }
     catch (error) {
@@ -1876,13 +1863,22 @@ exports.depGraphTool = (0, agents_1.tool)({
  */
 async function runSearchRepo(params) {
     const { query, caseSensitive = null, regex = null, wordBoundary = null, extensions = null, paths = null, contextLines = 5, maxResults = 200, } = params;
+    const safePaths = Array.isArray(paths)
+        ? paths.map((candidate) => {
+            const absolutePath = resolveRepoPath(candidate);
+            if (!absolutePath) {
+                throw new Error(`Search path is outside the repository: ${candidate}`);
+            }
+            return (0, path_1.relative)(process.cwd(), absolutePath) || ".";
+        })
+        : null;
     const cacheKey = {
         q: query,
         cs: caseSensitive,
         rx: regex,
         wb: wordBoundary,
         exts: Array.isArray(extensions) ? [...extensions].sort().join(",") : null,
-        p: Array.isArray(paths) ? [...paths].sort().join(",") : null,
+        p: Array.isArray(safePaths) ? [...safePaths].sort().join(",") : null,
         cl: contextLines,
         mr: maxResults,
     };
@@ -1895,7 +1891,7 @@ async function runSearchRepo(params) {
         return cached;
     }
     // Build ignore set from .codepressignore and defaults
-    const codepressIgnoreFiles = findCodepressIgnoreFiles(paths);
+    const codepressIgnoreFiles = findCodepressIgnoreFiles(safePaths);
     const ig = buildIgnoreMatcher(codepressIgnoreFiles);
     // Prefer ripgrep if available. It respects .gitignore and is fast.
     try {
@@ -1933,8 +1929,8 @@ async function runSearchRepo(params) {
         // Pattern
         args.push(pattern);
         // Paths scope or default to current directory
-        if (Array.isArray(paths) && paths.length > 0) {
-            for (const p of paths)
+        if (Array.isArray(safePaths) && safePaths.length > 0) {
+            for (const p of safePaths)
                 args.push(p);
         }
         else {
@@ -2660,6 +2656,7 @@ exports.allTools = [...baseTools, ...webTools];
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 "use strict";
+
 
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.main = main;
@@ -3527,20 +3524,6 @@ function shouldRunAction(context, config) {
 }
 async function run() {
     try {
-        if (core.getBooleanInput("isolated_mode")) {
-            const { runIsolatedReview } = await Promise.resolve().then(() => __importStar(__nccwpck_require__(44484)));
-            const provider = core.getInput("model_provider", { required: true });
-            const modelName = core.getInput("model_name", { required: true });
-            const deepseekApiKey = core.getInput("deepseek_api_key", { required: true });
-            const repositoryPath = core.getInput("repository_path", { required: true });
-            process.env.MODEL_PROVIDER = provider;
-            process.env.MODEL_NAME = modelName;
-            process.env.DEEPSEEK_API_KEY = deepseekApiKey;
-            process.chdir(repositoryPath);
-            await runIsolatedReview(core.getInput("review_input", { required: true }), core.getInput("report_path", { required: true }));
-            core.info("Isolated review report generated; this action did not publish or modify the pull request.");
-            return;
-        }
         // Get inputs from action.yml
         const githubToken = core.getInput("github_token", { required: true });
         const modelProvider = core.getInput("model_provider", { required: true });
@@ -3951,37 +3934,6 @@ if (process.env.NODE_ENV !== "test") {
     run();
 }
 //# sourceMappingURL=index.js.map
-
-/***/ }),
-
-/***/ 44484:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.runIsolatedReview = runIsolatedReview;
-const fs_1 = __nccwpck_require__(79896);
-const path_1 = __nccwpck_require__(16928);
-const agent_1 = __nccwpck_require__(70368);
-const config_1 = __nccwpck_require__(26634);
-async function runIsolatedReview(inputPath, reportPath) {
-    const input = JSON.parse((0, fs_1.readFileSync)((0, path_1.resolve)(inputPath), "utf8"));
-    if (!input.repo || !input.prNumber || !/^[0-9a-f]{40}$/i.test(input.commitSha)) {
-        throw new Error("Invalid isolated review input");
-    }
-    process.env.ISOLATED_REVIEW = "true";
-    process.env.ENABLE_WEB_SEARCH = "false";
-    const result = await (0, agent_1.reviewFullDiff)(await (0, config_1.getModelConfig)(), input.repositoryFiles, { repo: input.repo, prNumber: input.prNumber, commitSha: input.commitSha }, 18, false, [], [], [], input.prFilesFormatted);
-    (0, fs_1.writeFileSync)((0, path_1.resolve)(reportPath), JSON.stringify({
-        schemaVersion: 1,
-        repository: input.repo,
-        pullRequest: input.prNumber,
-        commitSha: input.commitSha,
-        result,
-    }, null, 2), { encoding: "utf8", mode: 0o600 });
-}
-//# sourceMappingURL=isolated-review.js.map
 
 /***/ }),
 
@@ -4511,7 +4463,7 @@ Object.defineProperties(CSSOM.CSSContainerRule.prototype, {
 			var values = "";
 			var valuesArr = [" {"];
       if (this.cssRules.length) {
-        valuesArr.push(this.cssRules.reduce(function(acc, rule){
+        valuesArr.push(this.cssRules.reduce(function(acc, rule){ 
           if (rule.cssText !== "") {
             acc.push(rule.cssText);
           }
@@ -4712,7 +4664,7 @@ Object.defineProperty(CSSOM.CSSFontFaceRule.prototype, "type", {
 
 Object.defineProperty(CSSOM.CSSFontFaceRule.prototype, "style", {
 	get: function() {
-		return this.__style;
+		return this.__style;	
 	},
 	set: function(value) {
 		if (typeof value === "string") {
@@ -4842,7 +4794,7 @@ Object.defineProperty(CSSOM.CSSGroupingRule.prototype, "cssRules", {
 	}
 	if (parsedRules.length !== 1) {
 		if (isNestedSelector && parsedRules.length === 0 && ruleToParse.indexOf('@font-face') === 0) {
-			errorUtils.throwError(this, 'DOMException',
+			errorUtils.throwError(this, 'DOMException', 
 				"Failed to execute 'insertRule' on '" + this.constructor.name + "': " +
 				"Only conditional nested group rules, style rules, @scope rules, @apply rules, and nested declaration rules may be nested.",
 				'HierarchyRequestError');
@@ -4853,23 +4805,23 @@ Object.defineProperty(CSSOM.CSSGroupingRule.prototype, "cssRules", {
 	var cssRule = parsedRules[0];
 
 	if (cssRule.constructor.name === 'CSSNestedDeclarations' && cssRule.style.length === 0) {
-		errorUtils.throwParseError(this, 'insertRule', this.constructor.name, ruleToParse, 'SyntaxError');
+		errorUtils.throwParseError(this, 'insertRule', this.constructor.name, ruleToParse, 'SyntaxError');	
 	}
-
+	
 	// Check for rules that cannot be inserted inside a CSSGroupingRule
 	if (cssRule.constructor.name === 'CSSImportRule' || cssRule.constructor.name === 'CSSNamespaceRule') {
 		var ruleKeyword = cssRule.constructor.name === 'CSSImportRule' ? '@import' : '@namespace';
-		errorUtils.throwError(this, 'DOMException',
+		errorUtils.throwError(this, 'DOMException', 
 			"Failed to execute 'insertRule' on '" + this.constructor.name + "': " +
 			"'" + ruleKeyword + "' rules cannot be inserted inside a group rule.",
 			'HierarchyRequestError');
 	}
-
+	
 	// Check for CSSLayerStatementRule (@layer statement rules)
 	if (cssRule.constructor.name === 'CSSLayerStatementRule') {
 		errorUtils.throwParseError(this, 'insertRule', this.constructor.name, ruleToParse, 'SyntaxError');
 	}
-
+	
 	cssRule.__parentRule = this;
 	this.cssRules.splice(index, 0, cssRule);
 	return index;
@@ -4951,7 +4903,7 @@ Object.defineProperty(CSSOM.CSSHostRule.prototype, "cssText", {
 		var values = "";
 		var valuesArr = [" {"];
 		if (this.cssRules.length) {
-			valuesArr.push(this.cssRules.reduce(function(acc, rule){
+			valuesArr.push(this.cssRules.reduce(function(acc, rule){ 
 			if (rule.cssText !== "") {
 				acc.push(rule.cssText);
 			}
@@ -5076,7 +5028,7 @@ Object.defineProperty(CSSOM.CSSImportRule.prototype, "parse", {
     var layerRegExp = regexPatterns.layerRegExp;
     var layerRuleNameRegExp = regexPatterns.layerRuleNameRegExp;
     var doubleOrMoreSpacesRegExp = regexPatterns.doubleOrMoreSpacesRegExp;
-
+    
     /**
      * Extracts the content inside supports() handling nested parentheses.
      * @param {string} text - The text to parse
@@ -5087,11 +5039,11 @@ Object.defineProperty(CSSOM.CSSImportRule.prototype, "parse", {
       if (supportsIndex !== 0) {
         return null;
       }
-
+      
       var depth = 0;
       var start = supportsIndex + 'supports('.length;
       var i = start;
-
+      
       for (; i < text.length; i++) {
         if (text[i] === '(') {
           depth++;
@@ -5106,7 +5058,7 @@ Object.defineProperty(CSSOM.CSSImportRule.prototype, "parse", {
           depth--;
         }
       }
-
+      
       return null; // Unbalanced parentheses
     }
 
@@ -5183,7 +5135,7 @@ Object.defineProperty(CSSOM.CSSImportRule.prototype, "parse", {
           if (state === 'media') {
             if (buffer) {
               var bufferTrimmed = buffer.trim();
-
+              
               if (bufferTrimmed.indexOf('layer') === 0) {
                 var layerMatch =  bufferTrimmed.match(layerRegExp);
 
@@ -5289,7 +5241,7 @@ Object.defineProperty(CSSOM.CSSKeyframeRule.prototype, "type", {
 
 Object.defineProperty(CSSOM.CSSKeyframeRule.prototype, "style", {
 	get: function() {
-		return this.__style;
+		return this.__style;	
 	},
 	set: function(value) {
 		if (typeof value === "string") {
@@ -5336,15 +5288,15 @@ CSSOM.CSSKeyframesRule = function CSSKeyframesRule() {
 	CSSOM.CSSRule.call(this);
 	this.name = '';
 	this.cssRules = new CSSOM.CSSRuleList();
-
+	
 	// Set up initial indexed access
 	this._setupIndexedAccess();
-
+	
 	// Override cssRules methods after initial setup, store references as non-enumerable properties
 	var self = this;
 	var originalPush = this.cssRules.push;
 	var originalSplice = this.cssRules.splice;
-
+	
 	// Create non-enumerable method overrides
 	Object.defineProperty(this.cssRules, 'push', {
 		value: function() {
@@ -5356,7 +5308,7 @@ CSSOM.CSSKeyframesRule = function CSSKeyframesRule() {
 		enumerable: false,
 		configurable: true
 	});
-
+	
 	Object.defineProperty(this.cssRules, 'splice', {
 		value: function() {
 			var result = originalSplice.apply(this, arguments);
@@ -5385,7 +5337,7 @@ Object.defineProperty(CSSOM.CSSKeyframesRule.prototype, "cssText", {
     var values = "";
 	var valuesArr = [" {"];
 	if (this.cssRules.length) {
-	valuesArr.push(this.cssRules.reduce(function(acc, rule){
+	valuesArr.push(this.cssRules.reduce(function(acc, rule){ 
 		if (rule.cssText !== "") {
 		acc.push(rule.cssText);
 		}
@@ -5401,7 +5353,7 @@ Object.defineProperty(CSSOM.CSSKeyframesRule.prototype, "cssText", {
 
 /**
  * Appends a new keyframe rule to the list of keyframes.
- *
+ * 
  * @param {string} rule - The keyframe rule string to append (e.g., "50% { opacity: 0.5; }")
  * @see https://www.w3.org/TR/css-animations-1/#dom-csskeyframesrule-appendrule
  */
@@ -5409,7 +5361,7 @@ CSSOM.CSSKeyframesRule.prototype.appendRule = function appendRule(rule) {
 	if (arguments.length === 0) {
 		errorUtils.throwMissingArguments(this, 'appendRule', 'CSSKeyframesRule');
 	}
-
+	
 	var parsedRule;
 	try {
 		// Parse the rule string as a keyframe rule
@@ -5422,14 +5374,14 @@ CSSOM.CSSKeyframesRule.prototype.appendRule = function appendRule(rule) {
 	} catch (e) {
 		errorUtils.throwParseError(this, 'appendRule', 'CSSKeyframesRule', rule);
 	}
-
+	
 	parsedRule.__parentRule = this;
 	this.cssRules.push(parsedRule);
 };
 
 /**
  * Deletes a keyframe rule that matches the specified key.
- *
+ * 
  * @param {string} select - The keyframe selector to delete (e.g., "50%", "from", "to")
  * @see https://www.w3.org/TR/css-animations-1/#dom-csskeyframesrule-deleterule
  */
@@ -5437,9 +5389,9 @@ CSSOM.CSSKeyframesRule.prototype.deleteRule = function deleteRule(select) {
 	if (arguments.length === 0) {
 		errorUtils.throwMissingArguments(this, 'deleteRule', 'CSSKeyframesRule');
 	}
-
+	
 	var normalizedSelect = this._normalizeKeyText(select);
-
+	
 	for (var i = 0; i < this.cssRules.length; i++) {
 		var rule = this.cssRules[i];
 		if (this._normalizeKeyText(rule.keyText) === normalizedSelect) {
@@ -5453,7 +5405,7 @@ CSSOM.CSSKeyframesRule.prototype.deleteRule = function deleteRule(select) {
 /**
  * Finds and returns the keyframe rule that matches the specified key.
  * When multiple rules have the same key, returns the last one.
- *
+ * 
  * @param {string} select - The keyframe selector to find (e.g., "50%", "from", "to")
  * @return {CSSKeyframeRule|null} The matching keyframe rule, or null if not found
  * @see https://www.w3.org/TR/css-animations-1/#dom-csskeyframesrule-findrule
@@ -5462,9 +5414,9 @@ CSSOM.CSSKeyframesRule.prototype.findRule = function findRule(select) {
 	if (arguments.length === 0) {
 		errorUtils.throwMissingArguments(this, 'findRule', 'CSSKeyframesRule');
 	}
-
+	
 	var normalizedSelect = this._normalizeKeyText(select);
-
+	
 	// Iterate backwards to find the last matching rule
 	for (var i = this.cssRules.length - 1; i >= 0; i--) {
 		var rule = this.cssRules[i];
@@ -5472,30 +5424,30 @@ CSSOM.CSSKeyframesRule.prototype.findRule = function findRule(select) {
 			return rule;
 		}
 	}
-
+	
 	return null;
 };
 
 /**
  * Normalizes keyframe selector text for comparison.
  * Handles "from" -> "0%" and "to" -> "100%" conversions and trims whitespace.
- *
+ * 
  * @private
  * @param {string} keyText - The keyframe selector text to normalize
  * @return {string} The normalized keyframe selector text
  */
 CSSOM.CSSKeyframesRule.prototype._normalizeKeyText = function _normalizeKeyText(keyText) {
 	if (!keyText) return '';
-
+	
 	var normalized = keyText.toString().trim().toLowerCase();
-
+	
 	// Convert keywords to percentages for comparison
 	if (normalized === 'from') {
 		return '0%';
 	} else if (normalized === 'to') {
 		return '100%';
 	}
-
+	
 	return normalized;
 };
 
@@ -5507,7 +5459,7 @@ if (typeof Symbol !== 'undefined' && Symbol.iterator) {
 	CSSOM.CSSKeyframesRule.prototype[Symbol.iterator] = function() {
 		var index = 0;
 		var cssRules = this.cssRules;
-
+		
 		return {
 			next: function() {
 				if (index < cssRules.length) {
@@ -5534,7 +5486,7 @@ CSSOM.CSSKeyframesRule.prototype._setupIndexedAccess = function() {
 			break;
 		}
 	}
-
+	
 	// Add indexed getters for current cssRules
 	for (var i = 0; i < this.cssRules.length; i++) {
 		(function(index) {
@@ -5547,7 +5499,7 @@ CSSOM.CSSKeyframesRule.prototype._setupIndexedAccess = function() {
 			});
 		}.call(this, i));
 	}
-
+	
 	// Update length property
 	Object.defineProperty(this, 'length', {
 		get: function() {
@@ -5605,7 +5557,7 @@ Object.defineProperties(CSSOM.CSSLayerBlockRule.prototype, {
 			var values = "";
 			var valuesArr = [" {"];
       if (this.cssRules.length) {
-        valuesArr.push(this.cssRules.reduce(function(acc, rule){
+        valuesArr.push(this.cssRules.reduce(function(acc, rule){ 
           if (rule.cssText !== "") {
             acc.push(rule.cssText);
           }
@@ -5728,7 +5680,7 @@ Object.defineProperties(CSSOM.CSSMediaRule.prototype, {
 			var values = "";
 			var valuesArr = [" {"];
       if (this.cssRules.length) {
-        valuesArr.push(this.cssRules.reduce(function(acc, rule){
+        valuesArr.push(this.cssRules.reduce(function(acc, rule){ 
           if (rule.cssText !== "") {
             acc.push(rule.cssText);
           }
@@ -5898,7 +5850,7 @@ Object.defineProperty(CSSOM.CSSNestedDeclarations.prototype, "type", {
 
 Object.defineProperty(CSSOM.CSSNestedDeclarations.prototype, "style", {
 	get: function() {
-		return this.__style;
+		return this.__style;	
 	},
 	set: function(value) {
 		if (typeof value === "string") {
@@ -5927,7 +5879,7 @@ exports.CSSNestedDeclarations = CSSOM.CSSNestedDeclarations;
 var CSSOM = {
   /**
    * Creates and configures a new CSSOM instance with the specified options.
-   *
+   * 
    * @param {Object} opts - Configuration options for the CSSOM instance
    * @param {Object} [opts.globalObject] - Optional global object to be assigned to CSSOM objects prototype
    * @returns {Object} A new CSSOM instance with the applied configuration
@@ -6028,18 +5980,18 @@ Object.defineProperty(CSSOM.CSSPageRule.prototype, "type", {
 
 Object.defineProperty(CSSOM.CSSPageRule.prototype, "selectorText", {
     get: function() {
-        return this.__selectorText;
+        return this.__selectorText;	
     },
     set: function(value) {
         if (typeof value === "string") {
             var trimmedValue = value.trim();
-
+            
             // Empty selector is valid for @page
             if (trimmedValue === '') {
                 this.__selectorText = '';
                 return;
             }
-
+            
 			var atPageRuleSelectorRegExp = regexPatterns.atPageRuleSelectorRegExp;
 			var cssCustomIdentifierRegExp = regexPatterns.cssCustomIdentifierRegExp;
             var match = trimmedValue.match(atPageRuleSelectorRegExp);
@@ -6054,7 +6006,7 @@ Object.defineProperty(CSSOM.CSSPageRule.prototype, "selectorText", {
 						return;
 					}
 				}
-
+                
                 // Validate pseudo-pages if present
                 if (pseudoPages) {
                     var pseudos = pseudoPages.split(':').filter(function(p) { return p; });
@@ -6066,12 +6018,12 @@ Object.defineProperty(CSSOM.CSSPageRule.prototype, "selectorText", {
                             break;
                         }
                     }
-
+                    
                     if (!allValid) {
                         return; // Invalid pseudo-page, do nothing
                     }
                 }
-
+                
 				this.__selectorText = pageName + pseudoPages.toLowerCase();
             }
         }
@@ -6080,7 +6032,7 @@ Object.defineProperty(CSSOM.CSSPageRule.prototype, "selectorText", {
 
 Object.defineProperty(CSSOM.CSSPageRule.prototype, "style", {
 	get: function() {
-		return this.__style;
+		return this.__style;	
 	},
 	set: function(value) {
 		if (typeof value === "string") {
@@ -6097,7 +6049,7 @@ Object.defineProperty(CSSOM.CSSPageRule.prototype, "cssText", {
         if (this.cssRules.length) {
             var valuesArr = [" {"];
             this.style.cssText && valuesArr.push(this.style.cssText);
-            valuesArr.push(this.cssRules.reduce(function(acc, rule){
+            valuesArr.push(this.cssRules.reduce(function(acc, rule){ 
 				if (rule.cssText !== "") {
 					acc.push(rule.cssText);
 				}
@@ -6202,29 +6154,29 @@ Object.defineProperty(CSSOM.CSSPropertyRule.prototype, "parse", {
 		if (!match) {
 			return false;
 		}
-
+		
 		this.__name = match[1];
 		var bodyText = match[2];
-
+		
 		// Parse syntax descriptor (REQUIRED)
 		var syntaxMatch = bodyText.match(/syntax\s*:\s*(['"])([^]*?)\1\s*;/);
 		if (!syntaxMatch) {
 			return false; // syntax is required
 		}
 		this.__syntax = syntaxMatch[2];
-
+		
 		// Syntax cannot be empty
 		if (this.__syntax === "") {
 			return false;
 		}
-
+		
 		// Parse inherits descriptor (REQUIRED)
 		var inheritsMatch = bodyText.match(/inherits\s*:\s*(true|false)\s*;/);
 		if (!inheritsMatch) {
 			return false; // inherits is required
 		}
 		this.__inherits = inheritsMatch[1] === "true";
-
+		
 		// Parse initial-value descriptor (OPTIONAL, but required if syntax is not "*")
 		var initialValueMatch = bodyText.match(/initial-value\s*:\s*([^;]+);/);
 		if (initialValueMatch) {
@@ -6235,7 +6187,7 @@ Object.defineProperty(CSSOM.CSSPropertyRule.prototype, "parse", {
 				return false;
 			}
 		}
-
+		
 		return true; // Successfully parsed
 	}
 });
@@ -6316,7 +6268,7 @@ Object.defineProperties(CSSOM.CSSRule.prototype, {
       return this.__parentStyleSheet
     }
   },
-
+  
   UNKNOWN_RULE: { value: 0, enumerable: true }, // obsolet
   STYLE_RULE: { value: 1, enumerable: true },
   CHARSET_RULE: { value: 2, enumerable: true }, // obsolet
@@ -6415,7 +6367,7 @@ Object.defineProperties(CSSOM.CSSScopeRule.prototype, {
 			var values = "";
 			var valuesArr = [" {"];
       if (this.cssRules.length) {
-        valuesArr.push(this.cssRules.reduce(function(acc, rule){
+        valuesArr.push(this.cssRules.reduce(function(acc, rule){ 
           if (rule.cssText !== "") {
             acc.push(rule.cssText);
           }
@@ -6486,7 +6438,7 @@ Object.defineProperty(CSSOM.CSSStartingStyleRule.prototype, "cssText", {
 		var values = "";
 		var valuesArr = [" {"];
 		if (this.cssRules.length) {
-			valuesArr.push(this.cssRules.reduce(function(acc, rule){
+			valuesArr.push(this.cssRules.reduce(function(acc, rule){ 
 			if (rule.cssText !== "") {
 				acc.push(rule.cssText);
 			}
@@ -6549,7 +6501,7 @@ CSSOM.CSSStyleDeclaration.prototype = {
 	 * @param {string} [priority=null] "important" or null
 	 * @see http://www.w3.org/TR/DOM-Level-2-Style/css.html#CSS-CSSStyleDeclaration-setProperty
 	 */
-	setProperty: function(name, value, priority, parseErrorHandler)
+	setProperty: function(name, value, priority, parseErrorHandler) 
 	{
 		// NOTE: Check viability to add a validation for css values or use a dependency like csstree-validator
 		var basicStylePropertyValueValidationRegExp = regexPatterns.basicStylePropertyValueValidationRegExp
@@ -6562,9 +6514,9 @@ CSSOM.CSSStyleDeclaration.prototype = {
 				this[this.length] = name;
 				this.length++;
 			}
-
+	
 			// If the priority value of the incoming property is "important",
-			// or the value of the existing property is not "important",
+			// or the value of the existing property is not "important", 
 			// then remove the existing property and rewrite it.
 			if (priority || !this._importants[name]) {
 				this.removeProperty(name);
@@ -6721,7 +6673,7 @@ Object.defineProperty(CSSOM.CSSStyleRule.prototype, "type", {
 
 Object.defineProperty(CSSOM.CSSStyleRule.prototype, "selectorText", {
 	get: function() {
-		return this.__selectorText;
+		return this.__selectorText;	
 	},
 	set: function(value) {
 		if (typeof value === "string") {
@@ -6748,7 +6700,7 @@ Object.defineProperty(CSSOM.CSSStyleRule.prototype, "selectorText", {
 
 Object.defineProperty(CSSOM.CSSStyleRule.prototype, "style", {
 	get: function() {
-		return this.__style;
+		return this.__style;	
 	},
 	set: function(value) {
 		if (typeof value === "string") {
@@ -6768,7 +6720,7 @@ Object.defineProperty(CSSOM.CSSStyleRule.prototype, "cssText", {
 			if (this.cssRules.length) {
 				var valuesArr = [" {"];
 				this.style.cssText && valuesArr.push(this.style.cssText);
-				valuesArr.push(this.cssRules.reduce(function(acc, rule){
+				valuesArr.push(this.cssRules.reduce(function(acc, rule){ 
 					if (rule.cssText !== "") {
 						acc.push(rule.cssText);
 					}
@@ -6819,7 +6771,7 @@ CSSOM.CSSStyleSheet = function CSSStyleSheet(opts) {
 	CSSOM.StyleSheet.call(this);
 	this.__constructed = true;
 	this.__cssRules = new CSSOM.CSSRuleList();
-	this.__ownerRule = null;
+	this.__ownerRule = null; 
 
 	if (opts && typeof opts === "object") {
 		if (opts.baseURL && typeof opts.baseURL === "string") {
@@ -6888,7 +6840,7 @@ CSSOM.CSSStyleSheet.prototype.insertRule = function(rule, index) {
 	if (index > this.cssRules.length) {
 		errorUtils.throwIndexError(this, 'insertRule', this.constructor.name, index, this.cssRules.length);
 	}
-
+	
 	var ruleToParse = String(rule);
 	var parseErrors = [];
 	var parsedSheet = CSSOM.parse(ruleToParse, undefined, function(err) {
@@ -6898,7 +6850,7 @@ CSSOM.CSSStyleSheet.prototype.insertRule = function(rule, index) {
 		errorUtils.throwParseError(this, 'insertRule', this.constructor.name, ruleToParse, 'SyntaxError');
 	}
 	var cssRule = parsedSheet.cssRules[0];
-
+	
 	// Helper function to find the last index of a specific rule constructor
 	function findLastIndexOfConstructor(rules, constructorName) {
 		for (var i = rules.length - 1; i >= 0; i--) {
@@ -6908,7 +6860,7 @@ CSSOM.CSSStyleSheet.prototype.insertRule = function(rule, index) {
 		}
 		return -1;
 	}
-
+	
 	// Helper function to find the first index of a rule that's NOT of specified constructors
 	function findFirstNonConstructorIndex(rules, constructorNames) {
 		for (var i = 0; i < rules.length; i++) {
@@ -6918,7 +6870,7 @@ CSSOM.CSSStyleSheet.prototype.insertRule = function(rule, index) {
 		}
 		return rules.length;
 	}
-
+	
 	// Validate rule ordering based on CSS specification
 	if (cssRule.constructor.name === 'CSSImportRule') {
 		if (this.__constructed === true) {
@@ -6934,10 +6886,10 @@ CSSOM.CSSStyleSheet.prototype.insertRule = function(rule, index) {
 				"Failed to execute 'insertRule' on '" + this.constructor.name + "': Failed to insert the rule.",
 				'HierarchyRequestError');
 		}
-
+		
 		// Also cannot insert after @namespace or other rules
 		var firstNonImportIndex = findFirstNonConstructorIndex(this.cssRules, ['CSSImportRule']);
-		if (index > firstNonImportIndex && firstNonImportIndex < this.cssRules.length &&
+		if (index > firstNonImportIndex && firstNonImportIndex < this.cssRules.length && 
 		    this.cssRules[firstNonImportIndex].constructor.name !== 'CSSLayerStatementRule') {
 			errorUtils.throwError(this, 'DOMException',
 				"Failed to execute 'insertRule' on '" + this.constructor.name + "': Failed to insert the rule.",
@@ -6954,25 +6906,25 @@ CSSOM.CSSStyleSheet.prototype.insertRule = function(rule, index) {
 			}
 		}
 		var firstNonImportNamespaceIndex = findFirstNonConstructorIndex(this.cssRules, [
-			'CSSLayerStatementRule',
-			'CSSImportRule',
+			'CSSLayerStatementRule', 
+			'CSSImportRule', 
 			'CSSNamespaceRule'
 		]);
-
+		
 		// Cannot insert before @import rules
 		if (firstImportIndex !== -1 && index <= firstImportIndex) {
 			errorUtils.throwError(this, 'DOMException',
 				"Failed to execute 'insertRule' on '" + this.constructor.name + "': Failed to insert the rule.",
 				'HierarchyRequestError');
 		}
-
+		
 		// Cannot insert if there are already non-special rules
 		if (firstNonImportNamespaceIndex < this.cssRules.length) {
 			errorUtils.throwError(this, 'DOMException',
 				"Failed to execute 'insertRule' on '" + this.constructor.name + "': Failed to insert the rule.",
 				'InvalidStateError');
 		}
-
+		
 		// Cannot insert after other types of rules
 		if (index > firstNonImportNamespaceIndex) {
 			errorUtils.throwError(this, 'DOMException',
@@ -6980,7 +6932,7 @@ CSSOM.CSSStyleSheet.prototype.insertRule = function(rule, index) {
 				'HierarchyRequestError');
 		}
 
-
+		
 	} else if (cssRule.constructor.name === 'CSSLayerStatementRule') {
 		// @layer statement rules can be inserted anywhere before @import and @namespace
 		// No additional restrictions beyond what's already handled
@@ -6991,7 +6943,7 @@ CSSOM.CSSStyleSheet.prototype.insertRule = function(rule, index) {
 			'CSSImportRule',
 			'CSSNamespaceRule'
 		]);
-
+		
 		if (index < firstNonSpecialRuleIndex) {
 			errorUtils.throwError(this, 'DOMException',
 				"Failed to execute 'insertRule' on '" + this.constructor.name + "': Failed to insert the rule.",
@@ -7002,7 +6954,7 @@ CSSOM.CSSStyleSheet.prototype.insertRule = function(rule, index) {
 			errorUtils.throwParseError(this, 'insertRule', this.constructor.name, ruleToParse, 'SyntaxError');
 		}
 	}
-
+	
 	cssRule.__parentStyleSheet = this;
 	this.cssRules.splice(index, 0, cssRule);
 	return index;
@@ -7040,7 +6992,7 @@ CSSOM.CSSStyleSheet.prototype.deleteRule = function(index) {
 	if (index >= this.cssRules.length) {
 		errorUtils.throwIndexError(this, 'deleteRule', this.constructor.name, index, this.cssRules.length);
 	}
-	if (this.cssRules[index]) {
+	if (this.cssRules[index]) {		
 		if (this.cssRules[index].constructor.name == "CSSNamespaceRule") {
 			var shouldContinue = this.cssRules.every(function (rule) {
 				return ['CSSImportRule','CSSLayerStatementRule','CSSNamespaceRule'].indexOf(rule.constructor.name) !== -1
@@ -7068,7 +7020,7 @@ CSSOM.CSSStyleSheet.prototype.removeRule = function(index) {
 
 /**
  * Replaces the rules of a {@link CSSStyleSheet}
- *
+ * 
  * @returns a promise
  * @see https://www.w3.org/TR/cssom-1/#dom-cssstylesheet-replace
  */
@@ -7122,7 +7074,7 @@ CSSOM.CSSStyleSheet.prototype.replace = function(text) {
 
 /**
  * Synchronously replaces the rules of a {@link CSSStyleSheet}
- *
+ * 
  * @see https://www.w3.org/TR/cssom-1/#dom-cssstylesheet-replacesync
  */
 CSSOM.CSSStyleSheet.prototype.replaceSync = function(text) {
@@ -7194,7 +7146,7 @@ CSSOM.CSSSupportsRule = function CSSSupportsRule() {
 
 CSSOM.CSSSupportsRule.prototype = Object.create(CSSOM.CSSConditionRule.prototype);
 CSSOM.CSSSupportsRule.prototype.constructor = CSSOM.CSSSupportsRule;
-
+  
 Object.setPrototypeOf(CSSOM.CSSSupportsRule, CSSOM.CSSConditionRule);
 
 Object.defineProperty(CSSOM.CSSSupportsRule.prototype, "type", {
@@ -7207,7 +7159,7 @@ Object.defineProperty(CSSOM.CSSSupportsRule.prototype, "cssText", {
     var values = "";
     var valuesArr = [" {"];
     if (this.cssRules.length) {
-      valuesArr.push(this.cssRules.reduce(function(acc, rule){
+      valuesArr.push(this.cssRules.reduce(function(acc, rule){ 
         if (rule.cssText !== "") {
           acc.push(rule.cssText);
         }
@@ -7456,7 +7408,7 @@ CSSOM.CSSValueExpression.prototype._parseJSComment = function(token, idx) {
  * @return {Object|false}
  *					- idx:
  *					- text:
- *					or
+ *					or 
  *					false
  *
  */
@@ -7483,14 +7435,14 @@ CSSOM.CSSValueExpression.prototype._parseJSString = function(token, idx, sep) {
  * @return {Object|false}
  *				- idx:
  *				- regExp:
- *				or
+ *				or 
  *				false
  */
 
 /*
 
 all legal RegExp
-
+ 
 /a/
 (/a/)
 [/a/]
@@ -7984,7 +7936,7 @@ try {
  * Gets the appropriate error constructor from the global object context.
  * Tries to find the error constructor from parentStyleSheet.__globalObject,
  * then from __globalObject, then falls back to the native constructor.
- *
+ * 
  * @param {Object} context - The CSSOM object (rule, stylesheet, etc.)
  * @param {string} errorType - The error type ('TypeError', 'RangeError', 'DOMException', etc.)
  * @return {Function} The error constructor
@@ -7994,26 +7946,26 @@ function getErrorConstructor(context, errorType) {
 	if (context.parentStyleSheet && context.parentStyleSheet.__globalObject && context.parentStyleSheet.__globalObject[errorType]) {
 		return context.parentStyleSheet.__globalObject[errorType];
 	}
-
+	
 	// Try __parentStyleSheet (alternative naming)
 	if (context.__parentStyleSheet && context.__parentStyleSheet.__globalObject && context.__parentStyleSheet.__globalObject[errorType]) {
 		return context.__parentStyleSheet.__globalObject[errorType];
 	}
-
+	
 	// Try __globalObject on the context itself
 	if (context.__globalObject && context.__globalObject[errorType]) {
 		return context.__globalObject[errorType];
 	}
-
+	
 	// Fall back to native constructor
-	return (typeof global !== 'undefined' && global[errorType]) ||
-	       (typeof window !== 'undefined' && window[errorType]) ||
+	return (typeof global !== 'undefined' && global[errorType]) || 
+	       (typeof window !== 'undefined' && window[errorType]) || 
 	       eval(errorType);
 }
 
 /**
  * Creates an appropriate error with context-aware constructor.
- *
+ * 
  * @param {Object} context - The CSSOM object (rule, stylesheet, etc.)
  * @param {string} errorType - The error type ('TypeError', 'RangeError', 'DOMException', etc.)
  * @param {string} message - The error message
@@ -8026,7 +7978,7 @@ function createError(context, errorType, message, name) {
 
 /**
  * Creates and throws an appropriate error with context-aware constructor.
- *
+ * 
  * @param {Object} context - The CSSOM object (rule, stylesheet, etc.)
  * @param {string} errorType - The error type ('TypeError', 'RangeError', 'DOMException', etc.)
  * @param {string} message - The error message
@@ -8038,7 +7990,7 @@ function throwError(context, errorType, message, name) {
 
 /**
  * Throws a TypeError for missing required arguments.
- *
+ * 
  * @param {Object} context - The CSSOM object
  * @param {string} methodName - The method name (e.g., 'appendRule')
  * @param {string} objectName - The object name (e.g., 'CSSKeyframesRule')
@@ -8048,15 +8000,15 @@ function throwError(context, errorType, message, name) {
 function throwMissingArguments(context, methodName, objectName, required, provided) {
 	required = required || 1;
 	provided = provided || 0;
-	var message = "Failed to execute '" + methodName + "' on '" + objectName + "': " +
-	              required + " argument" + (required > 1 ? "s" : "") + " required, but only " +
+	var message = "Failed to execute '" + methodName + "' on '" + objectName + "': " + 
+	              required + " argument" + (required > 1 ? "s" : "") + " required, but only " + 
 	              provided + " present.";
 	throwError(context, 'TypeError', message);
 }
 
 /**
  * Throws a DOMException for parse errors.
- *
+ * 
  * @param {Object} context - The CSSOM object
  * @param {string} methodName - The method name
  * @param {string} objectName - The object name
@@ -8071,7 +8023,7 @@ function throwParseError(context, methodName, objectName, rule, name) {
 
 /**
  * Throws a DOMException for index errors.
- *
+ * 
  * @param {Object} context - The CSSOM object
  * @param {string} methodName - The method name
  * @param {string} objectName - The object name
@@ -8342,8 +8294,8 @@ CSSOM.parse = function parse(token, opts, errorHandler) {
 	var backslashRegExp = regexPatterns.backslashRegExp;
 
 	/**
-	 * Searches for the first occurrence of a CSS at-rule statement terminator (`;` or `}`)
-	 * that is not inside a brace block within the given string. Mimics the behavior of a
+	 * Searches for the first occurrence of a CSS at-rule statement terminator (`;` or `}`) 
+	 * that is not inside a brace block within the given string. Mimics the behavior of a 
 	 * regular expression match for such terminators, including any trailing whitespace.
 	 * @param {string} str - The string to search for at-rule statement terminators.
 	 * @returns {object | null} {0: string, index: number} or null if no match is found.
@@ -8494,7 +8446,7 @@ CSSOM.parse = function parse(token, opts, errorHandler) {
 
 	/**
 	 * Validates balanced parentheses, brackets, and quotes in a selector.
-	 *
+	 * 
 	 * @param {string} selector - The CSS selector to validate
 	 * @param {boolean} trackAttributes - Whether to track attribute selector context
 	 * @param {boolean} useStack - Whether to use a stack for parentheses (needed for nested validation)
@@ -8697,7 +8649,7 @@ CSSOM.parse = function parse(token, opts, errorHandler) {
 			// Only scan from the last known validation boundary
 			var searchStart = Math.max(0, lastValidationBoundary);
 			var beforeSlice = token.slice(searchStart, i);
-
+			
 			// Use pre-compiled regex instead of creating new one each time
 			var matches = beforeSlice.match(regexBefore);
 			var lastI = matches ? searchStart + beforeSlice.lastIndexOf(matches[matches.length - 1]) : searchStart;
@@ -8876,17 +8828,17 @@ CSSOM.parse = function parse(token, opts, errorHandler) {
 	/**
 	 * Helper function to validate CSS selector syntax without regex backtracking.
 	 * Iteratively parses the selector string to identify valid components.
-	 *
+	 * 
 	 * Supports:
 	 * - Escaped characters (e.g., .class\!, #id\@name)
 	 * - Namespace selectors (ns|element, *|element, |element)
 	 * - All standard CSS selectors (class, ID, type, attribute, pseudo, etc.)
 	 * - Combinators (>, +, ~, whitespace)
 	 * - Nesting selector (&)
-	 *
+	 * 
 	 * This approach eliminates exponential backtracking by using explicit character-by-character
 	 * parsing instead of nested quantifiers in regex.
-	 *
+	 * 
 	 * @param {string} selector - The selector to validate
 	 * @returns {boolean} - True if valid selector syntax
 	 */
@@ -9107,7 +9059,7 @@ CSSOM.parse = function parse(token, opts, errorHandler) {
 	/**
 	 * Validates a basic CSS selector, allowing for deeply nested balanced parentheses in pseudo-classes.
 	 * This function replaces the previous basicSelectorRegExp.
-	 *
+	 * 
 	 * This function matches:
 	 * - Type selectors (e.g., `div`, `span`)
 	 * - Universal selector (`*`)
@@ -9243,13 +9195,13 @@ CSSOM.parse = function parse(token, opts, errorHandler) {
 	/**
 	 * Extract pseudo-classes with arguments from a selector using iterative parsing.
 	 * Replaces the previous globalPseudoClassRegExp to avoid exponential backtracking.
-	 *
+	 * 
 	 * Handles:
 	 * - Regular content without parentheses or quotes
 	 * - Single-quoted strings
-	 * - Double-quoted strings
+	 * - Double-quoted strings  
 	 * - Nested parentheses (arbitrary depth)
-	 *
+	 * 
 	 * @param {string} selector - The CSS selector to parse
 	 * @returns {Array} Array of matches, each with: [fullMatch, pseudoName, pseudoArgs, startIndex]
 	 */
@@ -9481,7 +9433,7 @@ CSSOM.parse = function parse(token, opts, errorHandler) {
 
 	/**
 	 * Validates namespace selectors by checking if the namespace prefix is defined.
-	 *
+	 * 
 	 * @param {string} selector - The CSS selector to validate
 	 * @returns {boolean} Returns true if the namespace is valid, false otherwise
 	 */
@@ -9550,7 +9502,7 @@ CSSOM.parse = function parse(token, opts, errorHandler) {
 	/**
 	 * Normalizes escape sequences in a selector to match browser behavior.
 	 * Decodes escape sequences and re-encodes them in canonical form.
-	 *
+	 * 
 	 * @param {string} selector - The selector to normalize
 	 * @returns {string} Normalized selector
 	 */
@@ -9558,17 +9510,17 @@ CSSOM.parse = function parse(token, opts, errorHandler) {
 		var result = '';
 		var i = 0;
 		var nextChar = '';
-
+		
 		// Track context for identifier boundaries
 		var inIdentifier = false;
 		var inAttribute = false;
 		var attributeDepth = 0;
 		var needsEscapeForIdent = false;
 		var lastWasHexEscape = false;
-
+		
 		while (i < selector.length) {
 			var char = selector[i];
-
+			
 			// Track attribute selector context
 			if (char === '[' && !inAttribute) {
 				inAttribute = true;
@@ -9580,7 +9532,7 @@ CSSOM.parse = function parse(token, opts, errorHandler) {
 				lastWasHexEscape = false;
 				continue;
 			}
-
+			
 			if (inAttribute) {
 				if (char === '[') attributeDepth++;
 				if (char === ']') {
@@ -9599,7 +9551,7 @@ CSSOM.parse = function parse(token, opts, errorHandler) {
 				lastWasHexEscape = false;
 				continue;
 			}
-
+			
 			// Handle escape sequences
 			if (char === '\\') {
 				var escapeLen = getEscapeSequenceLength(selector, i);
@@ -9609,11 +9561,11 @@ CSSOM.parse = function parse(token, opts, errorHandler) {
 					var wasHexEscape = startsWithHexEscapeRegExp.test(escapeSeq);
 					var hadTerminatingSpace = wasHexEscape && escapeSeq[escapeLen - 1] === ' ';
 					nextChar = selector[i + escapeLen] || '';
-
+					
 					// Check if this character needs escaping
 					var needsEscape = false;
 					var useHexEscape = false;
-
+					
 					if (needsEscapeForIdent) {
 						// At start of identifier (after . # or -)
 						// Digits must be escaped, letters/underscore/_/- don't need escaping
@@ -9634,14 +9586,14 @@ CSSOM.parse = function parse(token, opts, errorHandler) {
 							needsEscape = true;
 						}
 					}
-
+					
 					if (needsEscape) {
 						if (useHexEscape) {
 							// Use normalized hex escape
 							var codePoint = decoded.charCodeAt(0);
 							var hex = codePoint.toString(16);
 							result += '\\' + hex;
-							// Add space if next char could continue the hex sequence,
+							// Add space if next char could continue the hex sequence, 
 							// or if at end of selector (to disambiguate the escape)
 							if (isHexDigit(nextChar) || !nextChar || afterHexEscapeSeparatorRegExp.test(nextChar)) {
 								result += ' ';
@@ -9667,7 +9619,7 @@ CSSOM.parse = function parse(token, opts, errorHandler) {
 						}
 						lastWasHexEscape = false;
 					}
-
+					
 					i += escapeLen;
 					// After processing escape, check if we're still needing ident validation
 					// Only stay in needsEscapeForIdent state if decoded was '-'
@@ -9676,7 +9628,7 @@ CSSOM.parse = function parse(token, opts, errorHandler) {
 					continue;
 				}
 			}
-
+			
 			// Handle regular characters
 			if (char === '.' || char === '#') {
 				result += char;
@@ -9742,13 +9694,13 @@ CSSOM.parse = function parse(token, opts, errorHandler) {
 				i++;
 			}
 		}
-
+		
 		return result;
 	}
 
 	/**
 	 * Helper function to decode all escape sequences in a string.
-	 *
+	 * 
 	 * @param {string} str - The string to decode
 	 * @returns {string} The decoded string
 	 */
@@ -9773,7 +9725,7 @@ CSSOM.parse = function parse(token, opts, errorHandler) {
 
 	/**
 	 * Decodes a CSS escape sequence to its character value.
-	 *
+	 * 
 	 * @param {string} escapeSeq - The escape sequence (including backslash)
 	 * @returns {string} The decoded character
 	 */
@@ -9781,9 +9733,9 @@ CSSOM.parse = function parse(token, opts, errorHandler) {
 		if (escapeSeq.length < 2 || escapeSeq[0] !== '\\') {
 			return escapeSeq;
 		}
-
+		
 		var content = escapeSeq.substring(1);
-
+		
 		// Check if it's a hex escape
 		var hexMatch = content.match(hexEscapeSequenceRegExp);
 		if (hexMatch) {
@@ -9798,7 +9750,7 @@ CSSOM.parse = function parse(token, opts, errorHandler) {
 			}
 			return String.fromCharCode(codePoint);
 		}
-
+		
 		// Simple escape - return the character after backslash
 		return content[0] || '';
 	}
@@ -9809,23 +9761,23 @@ CSSOM.parse = function parse(token, opts, errorHandler) {
 	 *   [attr=value] -> [attr="value"]
 	 *   [attr="value"] -> [attr="value"] (unchanged)
 	 *   [attr='value'] -> [attr="value"] (converted to double quotes)
-	 *
+	 * 
 	 * @param {string} selector - The selector to normalize
 	 * @returns {string|null} Normalized selector, or null if invalid
 	 */
 	function normalizeAttributeSelectors(selector) {
 		var result = '';
 		var i = 0;
-
+		
 		while (i < selector.length) {
 			// Look for attribute selector start
 			if (selector[i] === '[') {
 				result += '[';
 				i++;
-
+				
 				var attrContent = '';
 				var depth = 1;
-
+				
 				// Find the closing bracket, handling nested brackets and escapes
 				while (i < selector.length && depth > 0) {
 					if (selector[i] === '\\' && i + 1 < selector.length) {
@@ -9841,7 +9793,7 @@ CSSOM.parse = function parse(token, opts, errorHandler) {
 					attrContent += selector[i];
 					i++;
 				}
-
+				
 				// Normalize the attribute content
 				var normalized = normalizeAttributeContent(attrContent);
 				if (normalized === null) {
@@ -9858,7 +9810,7 @@ CSSOM.parse = function parse(token, opts, errorHandler) {
 				i++;
 			}
 		}
-
+		
 		return result;
 	}
 
@@ -9912,33 +9864,33 @@ CSSOM.parse = function parse(token, opts, errorHandler) {
 	function normalizeAttributeContent(content) {
 		// Match: attribute-name [operator] [value] [flag]
 		var match = content.match(attributeSelectorContentRegExp);
-
+		
 		if (!match) {
 			// No operator (e.g., [disabled]) or malformed - return as is
 			return content;
 		}
-
+		
 		var attrName = match[1];
 		var operator = match[2];
 		var valueAndFlag = match[3].trim(); // Trim here instead of in regex
-
+		
 		// Check if there's a case-sensitivity flag (i or s) at the end
 		var flagMatch = valueAndFlag.match(attributeCaseFlagRegExp);
 		var value = flagMatch ? flagMatch[1] : valueAndFlag;
 		var flag = flagMatch ? flagMatch[2] : '';
-
+		
 		// Check for unclosed quotes - this makes the selector invalid
 		var trimmedValue = value.trim();
 		var firstChar = trimmedValue[0];
-
+		
 		if (firstChar === '"') {
 			return processQuotedAttributeValue(trimmedValue, '"', attrName, operator, flag);
 		}
-
+		
 		if (firstChar === "'") {
 			return processQuotedAttributeValue(trimmedValue, "'", attrName, operator, flag);
 		}
-
+		
 		// Check for unescaped special characters in unquoted values
 		// Escaped special characters are valid (e.g., \` is valid, but ` is not)
 		var hasUnescapedSpecialChar = false;
@@ -9958,26 +9910,26 @@ CSSOM.parse = function parse(token, opts, errorHandler) {
 				break;
 			}
 		}
-
+		
 		if (hasUnescapedSpecialChar) {
 			return null; // Unescaped special characters not allowed in unquoted attribute values
 		}
-
+		
 		// Decode escape sequences in the value before quoting
 		// Inside quotes, special characters don't need escaping
 		var decodedValue = decodeEscapeSequencesInString(trimmedValue);
-
+		
 		// If the decoded value contains double quotes, escape them for the output
 		// (since we're using double quotes as delimiters)
 		var escapedValue = decodedValue.replace(backslashRegExp, '\\\\').replace(doubleQuoteRegExp, '\\"');
-
+		
 		// Unquoted value - add double quotes with decoded and re-escaped content
 		return attrName + operator + '"' + escapedValue + '"' + (flag ? ' ' + flag : '');
 	}
 
 	/**
-	 * Processes a CSS selector text
-	 *
+	 * Processes a CSS selector text 
+	 * 
 	 * @param {string} selectorText - The CSS selector text to process
 	 * @returns {string} The processed selector text with normalized whitespace and invalid selectors removed
 	 */
@@ -10004,7 +9956,7 @@ CSSOM.parse = function parse(token, opts, errorHandler) {
 
 	/**
 	 * Recursively processes pseudo-classes to filter invalid selectors
-	 *
+	 * 
 	 * @param {string} selectorText - The CSS selector text to process
 	 * @param {number} depth - Current recursion depth (to prevent infinite loops)
 	 * @returns {string} The processed selector text with invalid selectors removed
@@ -10086,7 +10038,7 @@ CSSOM.parse = function parse(token, opts, errorHandler) {
 	function hasNewlineInQuotedString(selectorText) {
 		for (var i = 0; i < selectorText.length; i++) {
 			var char = selectorText[i];
-
+			
 			// Start of single-quoted string
 			if (char === "'") {
 				i++;
@@ -10257,9 +10209,9 @@ CSSOM.parse = function parse(token, opts, errorHandler) {
 		if (str[pos] !== '\\' || pos + 1 >= str.length) {
 			return 0;
 		}
-
+		
 		var nextChar = str[pos + 1];
-
+		
 		// Check if it's a hex escape
 		if (isHexDigit(nextChar)) {
 			var hexLength = 1;
@@ -10273,7 +10225,7 @@ CSSOM.parse = function parse(token, opts, errorHandler) {
 			}
 			return 1 + hexLength; // backslash + hex digits
 		}
-
+		
 		// Simple escape: backslash + any character
 		return 2;
 	}
@@ -10662,7 +10614,7 @@ CSSOM.parse = function parse(token, opts, errorHandler) {
 					}
 
 					currentScope = parentRule = styleRule;
-
+					
 					var processedSelectorText = processSelectorText(buffer.trim());
 					// In a nested selector, ensure each selector contains '&' at the beginning, except for selectors that already have '&' somewhere
 					if (originalParentRule && originalParentRule.constructor.name === "CSSStyleRule") {
@@ -10694,12 +10646,12 @@ CSSOM.parse = function parse(token, opts, errorHandler) {
 					currentScope = parentRule = mediaRule;
 					pushToAncestorRules(mediaRule);
 					mediaRule.__parentStyleSheet = styleSheet;
-
+					
 					// Don't reset styleRule to null if it's a nested CSSStyleRule that will contain this @-rule
 					if (!styleRule || styleRule.constructor.name !== "CSSStyleRule" || !styleRule.__parentRule) {
 						styleRule = null; // Reset styleRule when entering @-rule
 					}
-
+					
 					buffer = "";
 					state = "before-selector";
 				} else if (state === "containerBlock") {
@@ -10918,13 +10870,13 @@ CSSOM.parse = function parse(token, opts, errorHandler) {
 					}
 
 					styleRule = new CSSOM.CSSStyleRule();
-
+					
 					// Check if tokenizer detected an unmatched quote BEFORE setting up the rule
 					if (hasUnmatchedQuoteInSelector) {
 						handleUnmatchedQuoteInSelector("before-name");
 						break;
 					}
-
+					
 					var processedSelectorText = processSelectorText(buffer.trim());
 					// In a nested selector, ensure each selector contains '&' at the beginning, except for selectors that already have '&' somewhere
 					if (parentRule.constructor.name === "CSSScopeRule" || (parentRule.constructor.name !== "CSSStyleRule" && parentRule.parentRule === null)) {
@@ -10943,10 +10895,10 @@ CSSOM.parse = function parse(token, opts, errorHandler) {
 					if (parentRule.constructor.name === "CSSStyleRule" || parentRule.constructor.name === "CSSScopeRule") {
 						nestedSelectorRule = styleRule;
 					}
-
+					
 					// Set __parentStyleSheet for the new nested styleRule
 					styleRule.__parentStyleSheet = styleSheet;
-
+					
 					// Update currentScope and parentRule to the new nested styleRule
 					// so that subsequent content (like @-rules) will be children of this rule
 					currentScope = parentRule = styleRule;
@@ -11283,7 +11235,7 @@ CSSOM.parse = function parse(token, opts, errorHandler) {
 							}
 
 							// Determine if we're closing a special nested selector context
-							var isClosingNestedSelectorContext = nestedSelectorRule &&
+							var isClosingNestedSelectorContext = nestedSelectorRule && 
 								(currentScope === nestedSelectorRule || nestedSelectorRule.__parentRule === currentScope);
 
 							if (isClosingNestedSelectorContext) {
@@ -11597,17 +11549,17 @@ var regexPatterns = {
 	forwardImportRuleValidationRegExp: forwardImportRuleValidationRegExp,
 	forwardRuleClosingBraceRegExp: forwardRuleClosingBraceRegExp,
 	forwardRuleSemicolonAndOpeningBraceRegExp: forwardRuleSemicolonAndOpeningBraceRegExp,
-
+	
 	// Selector validation patterns
 	cssCustomIdentifierRegExp: cssCustomIdentifierRegExp,
 	startsWithCombinatorRegExp: startsWithCombinatorRegExp,
 	atPageRuleSelectorRegExp: atPageRuleSelectorRegExp,
-
+	
 	// Parsing patterns used in CSSImportRule
 	layerRegExp: layerRegExp,
 	layerRuleNameRegExp: layerRuleNameRegExp,
 	doubleOrMoreSpacesRegExp: doubleOrMoreSpacesRegExp,
-
+	
 	// Escape sequence and identifier patterns
 	startsWithHexEscapeRegExp: startsWithHexEscapeRegExp,
 	identStartCharRegExp: identStartCharRegExp,
@@ -12229,8 +12181,8 @@ class OidcClient {
             const res = yield httpclient
                 .getJson(id_token_url)
                 .catch(error => {
-                throw new Error(`Failed to get ID Token. \n
-        Error Code : ${error.statusCode}\n
+                throw new Error(`Failed to get ID Token. \n 
+        Error Code : ${error.statusCode}\n 
         Error Message: ${error.message}`);
             });
             const id_token = (_a = res.result) === null || _a === void 0 ? void 0 : _a.value;
@@ -24912,7 +24864,7 @@ var import_v4 = __nccwpck_require__(4447);
 var mistralLanguageModelOptions = import_v4.z.object({
   /**
   Whether to inject a safety prompt before all conversations.
-
+  
   Defaults to `false`.
      */
   safePrompt: import_v4.z.boolean().optional(),
@@ -28627,7 +28579,7 @@ var openaiCompletionProviderOptions = (0, import_provider_utils7.lazySchema)(
       echo: import_v45.z.boolean().optional(),
       /**
       Modify the likelihood of specified tokens appearing in the completion.
-
+      
       Accepts a JSON object that maps tokens (specified by their token ID in
       the GPT tokenizer) to an associated bias value from -100 to 100. You
       can use this tokenizer tool to convert text to token IDs. Mathematically,
@@ -28635,7 +28587,7 @@ var openaiCompletionProviderOptions = (0, import_provider_utils7.lazySchema)(
       The exact effect will vary per model, but values between -1 and 1 should
       decrease or increase likelihood of selection; values like -100 or 100
       should result in a ban or exclusive selection of the relevant token.
-
+      
       As an example, you can pass {"50256": -100} to prevent the <|endoftext|>
       token from being generated.
        */
@@ -56776,7 +56728,7 @@ exports.createIncrementalHTMLParser = function() {
         document: function() {
           return parser.document();
         },
-    };
+    };  
 };
 
 exports.createWindow = function(html, address) {
@@ -63152,7 +63104,7 @@ class RunToolApprovalItem extends RunItemBase {
     agent;
     toolName;
     type = 'tool_approval_item';
-    constructor(rawItem, agent,
+    constructor(rawItem, agent, 
     /**
      * Explicit tool name to use for approval tracking when not present on the raw item.
      */
@@ -64958,7 +64910,7 @@ class Runner extends lifecycle_1.RunHooks {
     /**
      * @internal
      */
-    async #runIndividualNonStream(startingAgent, input, options,
+    async #runIndividualNonStream(startingAgent, input, options, 
     // sessionInputUpdate lets the caller adjust queued session items after filters run so we
     // persist exactly what we send to the model (e.g., after redactions or truncation).
     sessionInputUpdate, preserveTurnPersistenceOnResume) {
@@ -79481,9 +79433,9 @@ function defineRealtimeOutputGuardrail({ policyHint: policyHintInput, ...options
  */
 function getRealtimeGuardrailFeedbackMessage(result) {
     return `
-⚠️ Your last answer was blocked.
-Failed Guardrail Reason: ${result.guardrail.policyHint}.
-Failure Details: ${JSON.stringify(result.output.outputInfo ?? {})}.
+⚠️ Your last answer was blocked. 
+Failed Guardrail Reason: ${result.guardrail.policyHint}. 
+Failure Details: ${JSON.stringify(result.output.outputInfo ?? {})}. 
 Please respond again following policy. Apologize for not being able to answer the question (while avoiding the specific reason) and divert discussion back to an approved topic immediately and not invite more discussion.
 `.trim();
 }
@@ -89897,7 +89849,7 @@ function removeHook(state, name, method) {
           var eosType = ref._eosType;
           /**
            * All the level runs in an isolating run sequence have the same embedding level.
-           *
+           * 
            * DO NOT change any `embedLevels[i]` within the current scope.
            */
           var embedDirection = ((embedLevels[seqIndices$1[0]]) & 1) ? TYPE_R : TYPE_L;
@@ -130338,7 +130290,7 @@ class SaxesParser {
         let { i: start } = this;
         const { chunk } = this;
         // eslint-disable-next-line no-labels, no-restricted-syntax
-        loop:
+        loop: 
         // eslint-disable-next-line no-constant-condition
         while (true) {
             switch (this.getCode()) {
@@ -131017,7 +130969,7 @@ class SaxesParser {
         let { i: start, forbiddenState } = this;
         const { chunk, textHandler: handler } = this;
         // eslint-disable-next-line no-labels, no-restricted-syntax
-        scanLoop:
+        scanLoop: 
         // eslint-disable-next-line no-constant-condition
         while (true) {
             switch (this.getCode()) {
@@ -131095,7 +131047,7 @@ class SaxesParser {
         const { chunk, textHandler: handler } = this;
         let nonSpace = false;
         // eslint-disable-next-line no-labels, no-restricted-syntax
-        outRootLoop:
+        outRootLoop: 
         // eslint-disable-next-line no-constant-condition
         while (true) {
             const code = this.getCode();
@@ -175657,7 +175609,7 @@ class Protocol {
         this.setNotificationHandler(types_js_1.ProgressNotificationSchema, notification => {
             this._onprogress(notification);
         });
-        this.setRequestHandler(types_js_1.PingRequestSchema,
+        this.setRequestHandler(types_js_1.PingRequestSchema, 
         // Automatic pong by default.
         _request => ({}));
         // Install task handlers if TaskStore is provided
@@ -289323,11 +289275,11 @@ class LRUCache {
             b.__abortController instanceof AC);
     }
     async fetch(k, fetchOptions = {}) {
-        const {
+        const { 
         // get options
-        allowStale = this.allowStale, updateAgeOnGet = this.updateAgeOnGet, noDeleteOnStaleGet = this.noDeleteOnStaleGet,
+        allowStale = this.allowStale, updateAgeOnGet = this.updateAgeOnGet, noDeleteOnStaleGet = this.noDeleteOnStaleGet, 
         // set options
-        ttl = this.ttl, noDisposeOnSet = this.noDisposeOnSet, size = 0, sizeCalculation = this.sizeCalculation, noUpdateTTL = this.noUpdateTTL,
+        ttl = this.ttl, noDisposeOnSet = this.noDisposeOnSet, size = 0, sizeCalculation = this.sizeCalculation, noUpdateTTL = this.noUpdateTTL, 
         // fetch exclusive options
         noDeleteOnFetchRejection = this.noDeleteOnFetchRejection, allowStaleOnFetchRejection = this.allowStaleOnFetchRejection, ignoreFetchAbort = this.ignoreFetchAbort, allowStaleOnFetchAbort = this.allowStaleOnFetchAbort, context, forceRefresh = false, status, signal, } = fetchOptions;
         if (!this.#hasFetchMethod) {
@@ -291913,7 +291865,7 @@ class OpenAI {
         catch (err) {
             if (err instanceof Errors.OpenAIError)
                 throw err;
-            throw new Errors.OpenAIError(`Failed to get token from 'apiKey' function: ${err.message}`,
+            throw new Errors.OpenAIError(`Failed to get token from 'apiKey' function: ${err.message}`, 
             // @ts-ignore
             { cause: err });
         }
@@ -293874,7 +293826,7 @@ function inner_stringify(object, prefix, generateArrayPrefix, commaRoundTrip, al
     }
     for (let j = 0; j < obj_keys.length; ++j) {
         const key = obj_keys[j];
-        const value =
+        const value = 
         // @ts-ignore
         typeof key === 'object' && typeof key.value !== 'undefined' ? key.value : obj[key];
         if (skipNulls && value === null) {
@@ -293890,7 +293842,7 @@ function inner_stringify(object, prefix, generateArrayPrefix, commaRoundTrip, al
         sideChannel.set(object, step);
         const valueSideChannel = new WeakMap();
         valueSideChannel.set(sentinel, sideChannel);
-        push_to_array(values, inner_stringify(value, key_prefix, generateArrayPrefix, commaRoundTrip, allowEmptyArrays, strictNullHandling, skipNulls, encodeDotInKeys,
+        push_to_array(values, inner_stringify(value, key_prefix, generateArrayPrefix, commaRoundTrip, allowEmptyArrays, strictNullHandling, skipNulls, encodeDotInKeys, 
         // @ts-ignore
         generateArrayPrefix === 'comma' && encodeValuesOnly && (0, values_1.isArray)(obj) ? null : encoder, filter, sort, allowDots, serializeDate, format, formatter, encodeValuesOnly, charset, valueSideChannel));
     }
@@ -293995,7 +293947,7 @@ function stringify(object, opts = {}) {
         if (options.skipNulls && obj[key] === null) {
             continue;
         }
-        push_to_array(keys, inner_stringify(obj[key], key,
+        push_to_array(keys, inner_stringify(obj[key], key, 
         // @ts-expect-error
         generateArrayPrefix, commaRoundTrip, options.allowEmptyArrays, options.strictNullHandling, options.skipNulls, options.encodeDotInKeys, options.encode ? options.encoder : null, options.filter, options.sort, options.allowDots, options.serializeDate, options.format, options.formatter, options.encodeValuesOnly, options.charset, sideChannel));
     }
@@ -334046,7 +333998,7 @@ function cleanParams(params, data) {
     const p2 = typeof p === "string" ? { message: p } : p;
     return p2;
 }
-function custom(check, _params = {},
+function custom(check, _params = {}, 
 /**
  * @deprecated
  *
@@ -337976,7 +337928,7 @@ exports.$ZodCheckGreaterThan = core.$constructor("$ZodCheckGreaterThan", (inst, 
         });
     };
 });
-exports.$ZodCheckMultipleOf =
+exports.$ZodCheckMultipleOf = 
 /*@__PURE__*/ core.$constructor("$ZodCheckMultipleOf", (inst, def) => {
     exports.$ZodCheck.init(inst, def);
     inst._zod.onattach.push((inst) => {
@@ -340945,7 +340897,7 @@ exports.$ZodObjectJIT = core.$constructor("$ZodObjectJIT", (inst, def) => {
             })));
           }
         }
-
+        
         if (${id}.value === undefined) {
           if (${k} in input) {
             newResult[${k}] = undefined;
@@ -340953,7 +340905,7 @@ exports.$ZodObjectJIT = core.$constructor("$ZodObjectJIT", (inst, def) => {
         } else {
           newResult[${k}] = ${id}.value;
         }
-
+        
       `);
             }
             else {
@@ -340964,7 +340916,7 @@ exports.$ZodObjectJIT = core.$constructor("$ZodObjectJIT", (inst, def) => {
             path: iss.path ? [${k}, ...iss.path] : [${k}]
           })));
         }
-
+        
         if (${id}.value === undefined) {
           if (${k} in input) {
             newResult[${k}] = undefined;
@@ -340972,7 +340924,7 @@ exports.$ZodObjectJIT = core.$constructor("$ZodObjectJIT", (inst, def) => {
         } else {
           newResult[${k}] = ${id}.value;
         }
-
+        
       `);
             }
         }
@@ -341137,7 +341089,7 @@ exports.$ZodXor = core.$constructor("$ZodXor", (inst, def) => {
         });
     };
 });
-exports.$ZodDiscriminatedUnion =
+exports.$ZodDiscriminatedUnion = 
 /*@__PURE__*/
 core.$constructor("$ZodDiscriminatedUnion", (inst, def) => {
     def.inclusive = false;
@@ -355853,7 +355805,7 @@ const decodeMap = new Map([
 /**
  * Polyfill for `String.fromCodePoint`. It is used to create a string from a Unicode code point.
  */
-const decode_codepoint_fromCodePoint =
+const decode_codepoint_fromCodePoint = 
 // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition, n/no-unsupported-features/es-builtins
 (_a = String.fromCodePoint) !== null && _a !== void 0 ? _a : function (codePoint) {
     let output = "";
@@ -355960,7 +355912,7 @@ var DecodingMode;
 class EntityDecoder {
     constructor(
     /** The tree used to decode entities. */
-    decodeTree,
+    decodeTree, 
     /**
      * The function that is called when a codepoint is decoded.
      *
@@ -355970,7 +355922,7 @@ class EntityDecoder {
      * @param codepoint The decoded codepoint.
      * @param consumed The number of bytes consumed by the decoder.
      */
-    emitCodePoint,
+    emitCodePoint, 
     /** An object that is used to produce errors. */
     errors) {
         this.decodeTree = decodeTree;
@@ -356283,7 +356235,7 @@ function getDecoder(decodeTree) {
         while ((offset = input.indexOf("&", offset)) >= 0) {
             returnValue += input.slice(lastIndex, offset);
             decoder.startEntity(decodeMode);
-            const length = decoder.write(input,
+            const length = decoder.write(input, 
             // Skip the "&"
             offset + 1);
             if (length < 0) {
@@ -360643,9 +360595,9 @@ const defaultParserOptions = {
 };
 //Parser
 class Parser {
-    constructor(options, document,
+    constructor(options, document, 
     /** @internal */
-    fragmentContext = null,
+    fragmentContext = null, 
     /** @internal */
     scriptHandler = null) {
         this.fragmentContext = fragmentContext;
@@ -360966,7 +360918,7 @@ class Parser {
         if (this.treeAdapter.getNodeSourceCodeLocation(element) && closingToken.location) {
             const ctLoc = closingToken.location;
             const tn = this.treeAdapter.getTagName(element);
-            const endLoc =
+            const endLoc = 
             // NOTE: For cases like <p> <p> </p> - First 'p' closes without a closing
             // tag and for cases like <td> <p> </td> - 'p' closes without a closing tag.
             closingToken.type === TokenType.END_TAG && tn === closingToken.tagName
@@ -363840,7 +363792,7 @@ const xmlCodeMap = new Map([
     [62, "&gt;"],
 ]);
 // For compatibility with node < 4, we wrap `codePointAt`
-const getCodePoint =
+const getCodePoint = 
 // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
 String.prototype.codePointAt == null
     ? (c, index) => (c.charCodeAt(index) & 64512) === 55296
@@ -363929,7 +363881,7 @@ const escapeUTF8 = /* #__PURE__ */ (/* unused pure expression or super */ null &
  *
  * @param data String to escape.
  */
-const escapeAttribute =
+const escapeAttribute = 
 /* #__PURE__ */ getEscaper(/["&\u00A0]/g, new Map([
     [34, "&quot;"],
     [38, "&amp;"],
@@ -364265,7 +364217,7 @@ module.exports = /*#__PURE__*/JSON.parse('[[[0,44],2],[[45,46],2],[47,2],[[48,57
 /************************************************************************/
 /******/ 	// The module cache
 /******/ 	var __webpack_module_cache__ = {};
-/******/
+/******/ 	
 /******/ 	// The require function
 /******/ 	function __nccwpck_require__(moduleId) {
 /******/ 		// Check if module is in cache
@@ -364279,7 +364231,7 @@ module.exports = /*#__PURE__*/JSON.parse('[[[0,44],2],[[45,46],2],[47,2],[[48,57
 /******/ 			// no module.loaded needed
 /******/ 			exports: {}
 /******/ 		};
-/******/
+/******/ 	
 /******/ 		// Execute the module function
 /******/ 		var threw = true;
 /******/ 		try {
@@ -364288,11 +364240,11 @@ module.exports = /*#__PURE__*/JSON.parse('[[[0,44],2],[[45,46],2],[47,2],[[48,57
 /******/ 		} finally {
 /******/ 			if(threw) delete __webpack_module_cache__[moduleId];
 /******/ 		}
-/******/
+/******/ 	
 /******/ 		// Return the exports of the module
 /******/ 		return module.exports;
 /******/ 	}
-/******/
+/******/ 	
 /************************************************************************/
 /******/ 	/* webpack/runtime/create fake namespace object */
 /******/ 	(() => {
@@ -364323,7 +364275,7 @@ module.exports = /*#__PURE__*/JSON.parse('[[[0,44],2],[[45,46],2],[47,2],[[48,57
 /******/ 			return ns;
 /******/ 		};
 /******/ 	})();
-/******/
+/******/ 	
 /******/ 	/* webpack/runtime/define property getters */
 /******/ 	(() => {
 /******/ 		// define getter functions for harmony exports
@@ -364335,12 +364287,12 @@ module.exports = /*#__PURE__*/JSON.parse('[[[0,44],2],[[45,46],2],[47,2],[[48,57
 /******/ 			}
 /******/ 		};
 /******/ 	})();
-/******/
+/******/ 	
 /******/ 	/* webpack/runtime/hasOwnProperty shorthand */
 /******/ 	(() => {
 /******/ 		__nccwpck_require__.o = (obj, prop) => (Object.prototype.hasOwnProperty.call(obj, prop))
 /******/ 	})();
-/******/
+/******/ 	
 /******/ 	/* webpack/runtime/make namespace object */
 /******/ 	(() => {
 /******/ 		// define __esModule on exports
@@ -364351,18 +364303,18 @@ module.exports = /*#__PURE__*/JSON.parse('[[[0,44],2],[[45,46],2],[47,2],[[48,57
 /******/ 			Object.defineProperty(exports, '__esModule', { value: true });
 /******/ 		};
 /******/ 	})();
-/******/
+/******/ 	
 /******/ 	/* webpack/runtime/compat */
-/******/
+/******/ 	
 /******/ 	if (typeof __nccwpck_require__ !== 'undefined') __nccwpck_require__.ab = __dirname + "/";
-/******/
+/******/ 	
 /************************************************************************/
-/******/
+/******/ 	
 /******/ 	// startup
 /******/ 	// Load entry module and return exports
 /******/ 	// This entry module is referenced by other modules so it can't be inlined
 /******/ 	var __webpack_exports__ = __nccwpck_require__(11522);
 /******/ 	module.exports = __webpack_exports__;
-/******/
+/******/ 	
 /******/ })()
 ;

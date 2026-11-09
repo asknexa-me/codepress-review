@@ -565,6 +565,16 @@ export async function runSearchRepo(params: {
     maxResults = 200,
   } = params;
 
+  const safePaths = Array.isArray(paths)
+    ? paths.map((candidate) => {
+        const absolutePath = resolveRepoPath(candidate);
+        if (!absolutePath) {
+          throw new Error(`Search path is outside the repository: ${candidate}`);
+        }
+        return relative(process.cwd(), absolutePath) || ".";
+      })
+    : null;
+
   // Simple LRU cache for search results to avoid repeated repo scans
   type CacheKey = {
     q: string;
@@ -582,7 +592,7 @@ export async function runSearchRepo(params: {
     rx: regex,
     wb: wordBoundary,
     exts: Array.isArray(extensions) ? [...extensions].sort().join(",") : null,
-    p: Array.isArray(paths) ? [...paths].sort().join(",") : null,
+    p: Array.isArray(safePaths) ? [...safePaths].sort().join(",") : null,
     cl: contextLines,
     mr: maxResults,
   };
@@ -597,7 +607,7 @@ export async function runSearchRepo(params: {
   }
 
   // Build ignore set from .codepressignore and defaults
-  const codepressIgnoreFiles = findCodepressIgnoreFiles(paths);
+  const codepressIgnoreFiles = findCodepressIgnoreFiles(safePaths);
   const ig = buildIgnoreMatcher(codepressIgnoreFiles);
 
   // Prefer ripgrep if available. It respects .gitignore and is fast.
@@ -641,8 +651,8 @@ export async function runSearchRepo(params: {
     args.push(pattern);
 
     // Paths scope or default to current directory
-    if (Array.isArray(paths) && paths.length > 0) {
-      for (const p of paths) args.push(p);
+    if (Array.isArray(safePaths) && safePaths.length > 0) {
+      for (const p of safePaths) args.push(p);
     } else {
       args.push(".");
     }
