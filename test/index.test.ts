@@ -156,6 +156,30 @@ describe("GitHub Action main run function", () => {
     );
   });
 
+  it("should determine PR number from pull_request_target event", async () => {
+    Object.defineProperty(github, "context", {
+      value: {
+        repo: { owner: "test-owner", repo: "test-repo" },
+        eventName: "pull_request_target",
+        payload: {
+          action: "reopened",
+          pull_request: { number: 124 },
+        },
+        ref: "refs/heads/develop",
+      },
+      writable: true,
+    });
+
+    await run();
+
+    expect(core.info).toHaveBeenCalledWith(
+      "Running CodePress Review for PR #124",
+    );
+    expect(mockPullsGet).toHaveBeenCalledWith(
+      expect.objectContaining({ pull_number: 124 }),
+    );
+  });
+
   it("should determine PR number from issue_comment event", async () => {
     Object.defineProperty(github, "context", {
       value: {
