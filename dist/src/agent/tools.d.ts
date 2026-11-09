@@ -1,4 +1,5 @@
 import { z } from "zod";
+export declare function resolveRepoPath(path: string): string | null;
 /**
  * Tool to fetch the full contents of multiple files.
  */
@@ -107,8 +108,6 @@ export declare function getAllTools(): (import("@openai/agents").FunctionTool<un
     contextLines: z.ZodDefault<z.ZodNumber>;
     maxResults: z.ZodDefault<z.ZodNumber>;
 }, z.core.$strip>, string> | import("@openai/agents").FunctionTool<unknown, z.ZodObject<{
-    command: z.ZodString;
-}, z.core.$strip>, string> | import("@openai/agents").FunctionTool<unknown, z.ZodObject<{
     action: z.ZodEnum<{
         add: "add";
         done: "done";
@@ -143,8 +142,6 @@ export declare const allTools: (import("@openai/agents").FunctionTool<unknown, z
     paths: z.ZodOptional<z.ZodNullable<z.ZodArray<z.ZodString>>>;
     contextLines: z.ZodDefault<z.ZodNumber>;
     maxResults: z.ZodDefault<z.ZodNumber>;
-}, z.core.$strip>, string> | import("@openai/agents").FunctionTool<unknown, z.ZodObject<{
-    command: z.ZodString;
 }, z.core.$strip>, string> | import("@openai/agents").FunctionTool<unknown, z.ZodObject<{
     action: z.ZodEnum<{
         add: "add";

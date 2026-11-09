@@ -18,6 +18,17 @@ declare const ReviewCompletionSchema: z.ZodObject<{
         COMMENT: "COMMENT";
         NONE: "NONE";
     }>;
+    findings: z.ZodDefault<z.ZodArray<z.ZodObject<{
+        severity: z.ZodEnum<{
+            optional: "optional";
+            required: "required";
+        }>;
+        path: z.ZodString;
+        line: z.ZodNullable<z.ZodNumber>;
+        title: z.ZodString;
+        body: z.ZodString;
+        evidence: z.ZodString;
+    }, z.core.$strip>>>;
 }, z.core.$strip>;
 export type ReviewCompletion = z.infer<typeof ReviewCompletionSchema>;
 export interface PRContext {
@@ -37,6 +48,6 @@ export interface PRContext {
  * - Update PR description if blank
  */
 export declare function reviewFullDiff(modelConfig: ModelConfig, repoFilePaths: string[], prContext: PRContext, maxTurns?: number | null, // null = unlimited (default)
-blockingOnly?: boolean, existingComments?: ExistingReviewComment[], botPreviousComments?: BotComment[], relatedRepos?: RelatedRepo[], prFilesFormatted?: string): Promise<void>;
+blockingOnly?: boolean, existingComments?: ExistingReviewComment[], botPreviousComments?: BotComment[], relatedRepos?: RelatedRepo[], prFilesFormatted?: string): Promise<ReviewCompletion>;
 export {};
 //# sourceMappingURL=index.d.ts.map
