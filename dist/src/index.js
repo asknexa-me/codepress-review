@@ -43,19 +43,22 @@ const node_fs_2 = require("node:fs");
 const node_os_1 = require("node:os");
 const node_path_2 = require("node:path");
 const pr_files_1 = require("./pr-files");
+function isPullRequestEvent(eventName) {
+    return eventName === "pull_request" || eventName === "pull_request_target";
+}
 function getTriggerEvent(context, config) {
     const eventName = context.eventName;
     const action = context.payload.action;
-    if (eventName === "pull_request" && action === "opened") {
+    if (isPullRequestEvent(eventName) && action === "opened") {
         return "opened";
     }
-    if (eventName === "pull_request" && action === "reopened") {
+    if (isPullRequestEvent(eventName) && action === "reopened") {
         return "reopened";
     }
-    if (eventName === "pull_request" && action === "synchronize") {
+    if (isPullRequestEvent(eventName) && action === "synchronize") {
         return "synchronize";
     }
-    if (eventName === "pull_request" && action === "review_requested") {
+    if (isPullRequestEvent(eventName) && action === "review_requested") {
         return "review_requested";
     }
     if (eventName === "issue_comment" && action === "created") {
@@ -72,7 +75,7 @@ function shouldRunAction(context, config) {
     const eventName = context.eventName;
     const action = context.payload.action;
     // PR opened
-    if (eventName === "pull_request" && action === "opened") {
+    if (isPullRequestEvent(eventName) && action === "opened") {
         return {
             shouldRun: config.runOnPrOpened,
             reason: config.runOnPrOpened
@@ -81,7 +84,7 @@ function shouldRunAction(context, config) {
         };
     }
     // PR reopened
-    if (eventName === "pull_request" && action === "reopened") {
+    if (isPullRequestEvent(eventName) && action === "reopened") {
         return {
             shouldRun: config.runOnPrReopened,
             reason: config.runOnPrReopened
@@ -90,14 +93,14 @@ function shouldRunAction(context, config) {
         };
     }
     // PR synchronized (new commits pushed)
-    if (eventName === "pull_request" && action === "synchronize") {
+    if (isPullRequestEvent(eventName) && action === "synchronize") {
         return {
             shouldRun: true, // Always run on synchronize since user opted in by including the event
             reason: "New commits pushed to PR",
         };
     }
     // Review requested
-    if (eventName === "pull_request" && action === "review_requested") {
+    if (isPullRequestEvent(eventName) && action === "review_requested") {
         const requestedReviewer = context.payload.requested_reviewer;
         if (requestedReviewer?.login === "github-actions[bot]") {
             return {

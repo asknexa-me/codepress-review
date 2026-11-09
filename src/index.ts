@@ -30,6 +30,10 @@ interface TriggerConfig {
 
 type TriggerEventType = TriggerContext["triggerEvent"];
 
+function isPullRequestEvent(eventName: string): boolean {
+  return eventName === "pull_request" || eventName === "pull_request_target";
+}
+
 function getTriggerEvent(
   context: typeof github.context,
   config: TriggerConfig,
@@ -37,16 +41,16 @@ function getTriggerEvent(
   const eventName = context.eventName;
   const action = context.payload.action;
 
-  if (eventName === "pull_request" && action === "opened") {
+  if (isPullRequestEvent(eventName) && action === "opened") {
     return "opened";
   }
-  if (eventName === "pull_request" && action === "reopened") {
+  if (isPullRequestEvent(eventName) && action === "reopened") {
     return "reopened";
   }
-  if (eventName === "pull_request" && action === "synchronize") {
+  if (isPullRequestEvent(eventName) && action === "synchronize") {
     return "synchronize";
   }
-  if (eventName === "pull_request" && action === "review_requested") {
+  if (isPullRequestEvent(eventName) && action === "review_requested") {
     return "review_requested";
   }
   if (eventName === "issue_comment" && action === "created") {
@@ -73,7 +77,7 @@ function shouldRunAction(
   const action = context.payload.action;
 
   // PR opened
-  if (eventName === "pull_request" && action === "opened") {
+  if (isPullRequestEvent(eventName) && action === "opened") {
     return {
       shouldRun: config.runOnPrOpened,
       reason: config.runOnPrOpened
@@ -83,7 +87,7 @@ function shouldRunAction(
   }
 
   // PR reopened
-  if (eventName === "pull_request" && action === "reopened") {
+  if (isPullRequestEvent(eventName) && action === "reopened") {
     return {
       shouldRun: config.runOnPrReopened,
       reason: config.runOnPrReopened
@@ -93,7 +97,7 @@ function shouldRunAction(
   }
 
   // PR synchronized (new commits pushed)
-  if (eventName === "pull_request" && action === "synchronize") {
+  if (isPullRequestEvent(eventName) && action === "synchronize") {
     return {
       shouldRun: true, // Always run on synchronize since user opted in by including the event
       reason: "New commits pushed to PR",
@@ -101,7 +105,7 @@ function shouldRunAction(
   }
 
   // Review requested
-  if (eventName === "pull_request" && action === "review_requested") {
+  if (isPullRequestEvent(eventName) && action === "review_requested") {
     const requestedReviewer = context.payload.requested_reviewer;
     if (requestedReviewer?.login === "github-actions[bot]") {
       return {
